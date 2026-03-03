@@ -168,8 +168,17 @@ namespace HCPEngine
 
             if (clientFd < 0)
             {
+                fprintf(stderr, "[HCPSocketServer] accept() failed: %s (errno=%d, stopRequested=%d)\n",
+                    strerror(errno), errno, m_stopRequested.load() ? 1 : 0);
+                fflush(stderr);
                 if (m_stopRequested.load()) break;
-                AZLOG_ERROR("HCPSocketServer: accept() failed: %s", strerror(errno));
+                if (errno == EBADF || errno == EINVAL)
+                {
+                    // Listen fd was closed or is invalid — exit loop
+                    fprintf(stderr, "[HCPSocketServer] Listen fd invalid — exiting accept loop\n");
+                    fflush(stderr);
+                    break;
+                }
                 continue;
             }
 
@@ -183,6 +192,9 @@ namespace HCPEngine
             fflush(stderr);
         }
 
+        fprintf(stderr, "[HCPSocketServer] Accept loop exited (stopRequested=%d, listenFd=%d)\n",
+            m_stopRequested.load() ? 1 : 0, m_listenFd);
+        fflush(stderr);
         m_running.store(false);
     }
 
@@ -904,6 +916,163 @@ namespace HCPEngine
                 manifest.resolvedRuns, manifest.totalRuns,
                 manifest.totalRuns > 0 ? 100.0f * manifest.resolvedRuns / manifest.totalRuns : 0.0f,
                 manifest.totalTimeMs);
+            fflush(stderr);
+
+            return AZStd::string(sb.GetString(), sb.GetSize());
+        }
+
+        // ---- phys_ingest (Phase 1 + Phase 2 + scanner → PBM to Postgres) ----
+        if (strcmp(action, "phys_ingest") == 0)
+        {
+            AZStd::string text;
+            AZStd::string docName;
+            AZStd::string centuryCode = "AB";  // Default: 21st century
+            bool fictionFirst = true;  // Default: fiction entities have priority
+
+            if (doc.HasMember("corpus") && doc["corpus"].IsString())
+            {
+                AZStd::string corpus(doc["corpus"].GetString(), doc["corpus"].GetStringLength());
+                if (corpus == "nonfiction" || corpus == "nf")
+                    fictionFirst = false;
+            }
+
+            if (doc.HasMember("file") && doc["file"].IsString())
+            {
+                AZStd::string filePath(doc["file"].GetString(), doc["file"].GetStringLength());
+                std::ifstream ifs(filePath.c_str());
+                if (!ifs.is_open())
+                    return R"({"status":"error","message":"Could not open file"})";
+                std::string stdText((std::istreambuf_iterator<char>(ifs)),
+                                     std::istreambuf_iterator<char>());
+                ifs.close();
+                text = AZStd::string(stdText.c_str(), stdText.size());
+
+                // Derive doc name from filename if not provided
+                size_t lastSlash = filePath.rfind('/');
+                size_t lastDot = filePath.rfind('.');
+                if (lastSlash == AZStd::string::npos) lastSlash = 0; else ++lastSlash;
+                if (lastDot == AZStd::string::npos || lastDot <= lastSlash) lastDot = filePath.size();
+                docName = filePath.substr(lastSlash, lastDot - lastSlash);
+            }
+            else if (doc.HasMember("text") && doc["text"].IsString())
+            {
+                text = AZStd::string(doc["text"].GetString(), doc["text"].GetStringLength());
+            }
+            else
+            {
+                return R"({"status":"error","message":"phys_ingest requires 'file' or 'text'"})";
+            }
+
+            if (doc.HasMember("name") && doc["name"].IsString())
+                docName = AZStd::string(doc["name"].GetString(), doc["name"].GetStringLength());
+            if (doc.HasMember("century") && doc["century"].IsString())
+                centuryCode = AZStd::string(doc["century"].GetString(), doc["century"].GetStringLength());
+
+            if (docName.empty())
+                docName = "untitled";
+
+            // Check prerequisites
+            HCPParticlePipeline& pipeline = m_engine->GetParticlePipeline();
+            if (!pipeline.IsInitialized())
+                return R"({"status":"error","message":"Particle pipeline not initialized"})";
+
+            const HCPBondTable& charWordBonds = m_engine->GetCharWordBonds();
+            if (charWordBonds.PairCount() == 0)
+                return R"({"status":"error","message":"No char->word bond table loaded"})";
+
+            BedManager& bedManager = m_engine->GetBedManager();
+            if (!bedManager.IsInitialized())
+                return R"({"status":"error","message":"BedManager not initialized"})";
+
+            HCPDbConnection& dbConn = m_engine->GetDbConnection();
+            if (!dbConn.IsConnected()) dbConn.Connect();
+            if (!dbConn.IsConnected())
+                return R"({"status":"error","message":"No database connection"})";
+            HCPPbmWriter& pbmWriter = m_engine->GetPbmWriter();
+
+            fprintf(stderr, "[phys_ingest] Starting: '%s' (%zu bytes)\n",
+                docName.c_str(), text.size());
+            fflush(stderr);
+
+            // Phase 1: byte→char settlement
+            SuperpositionTrialResult phase1 = RunSuperpositionTrial(
+                pipeline.GetPhysics(), pipeline.GetScene(), pipeline.GetCuda(),
+                text, m_engine->GetVocabulary(), 0);
+
+            fprintf(stderr, "[phys_ingest] Phase 1: %u/%u settled (%.1f%%) in %.1f ms\n",
+                phase1.settledCount, phase1.totalCodepoints,
+                phase1.totalCodepoints > 0 ? 100.0f * phase1.settledCount / phase1.totalCodepoints : 0.0f,
+                phase1.simulationTimeMs);
+            fflush(stderr);
+
+            // Extract runs
+            AZStd::vector<CharRun> runs = ExtractRunsFromCollapses(phase1);
+            if (runs.empty())
+                return R"({"status":"error","message":"No runs from Phase 1"})";
+
+            // Phase 2: word resolution
+            ResolutionManifest manifest = bedManager.Resolve(runs);
+
+            fprintf(stderr, "[phys_ingest] Phase 2: %u/%u resolved (%.1f%%) in %.1f ms\n",
+                manifest.resolvedRuns, manifest.totalRuns,
+                manifest.totalRuns > 0 ? 100.0f * manifest.resolvedRuns / manifest.totalRuns : 0.0f,
+                manifest.totalTimeMs);
+            fflush(stderr);
+
+            // Entity annotation: multi-word entity recognition
+            auto& entityAnnotator = m_engine->GetEntityAnnotator();
+            if (entityAnnotator.IsInitialized())
+            {
+                entityAnnotator.AnnotateManifest(manifest, fictionFirst);
+            }
+
+            // Scanner: manifest → bonds + positions (single pass)
+            ManifestScanResult scan = ScanManifestToPBM(manifest);
+
+            // Build PBMData for StorePBM
+            PBMData pbmData;
+            pbmData.bonds = AZStd::move(scan.bonds);
+            pbmData.firstFpbA = scan.firstFpbA;
+            pbmData.firstFpbB = scan.firstFpbB;
+            pbmData.totalPairs = scan.totalPairs;
+            pbmData.uniqueTokens = scan.uniqueTokens;
+
+            // Store PBM (bonds + starters + vars)
+            AZStd::string docId = pbmWriter.StorePBM(docName, centuryCode, pbmData);
+            if (docId.empty())
+                return R"({"status":"error","message":"StorePBM failed"})";
+
+            // Store positions (with positional modifiers)
+            int docPk = pbmWriter.LastDocPk();
+            bool posOk = pbmWriter.StorePositions(
+                docPk, scan.tokenIds, scan.positions,
+                scan.totalSlots, scan.modifiers);
+
+            // Build response
+            rapidjson::StringBuffer sb;
+            rapidjson::Writer<rapidjson::StringBuffer> w(sb);
+            w.StartObject();
+            w.Key("status"); w.String("ok");
+            w.Key("doc_id"); w.String(docId.c_str());
+            w.Key("doc_pk"); w.Int(docPk);
+            w.Key("doc_name"); w.String(docName.c_str());
+            w.Key("phase1_settled"); w.Uint(phase1.settledCount);
+            w.Key("phase1_total"); w.Uint(phase1.totalCodepoints);
+            w.Key("phase1_time_ms"); w.Double(static_cast<double>(phase1.simulationTimeMs));
+            w.Key("total_runs"); w.Uint(manifest.totalRuns);
+            w.Key("resolved"); w.Uint(manifest.resolvedRuns);
+            w.Key("unresolved"); w.Uint(manifest.unresolvedRuns);
+            w.Key("resolve_time_ms"); w.Double(static_cast<double>(manifest.totalTimeMs));
+            w.Key("bond_types"); w.Uint64(pbmData.bonds.size());
+            w.Key("total_pairs"); w.Uint64(scan.totalPairs);
+            w.Key("unique_tokens"); w.Uint64(scan.uniqueTokens);
+            w.Key("total_slots"); w.Int(scan.totalSlots);
+            w.Key("positions_stored"); w.Bool(posOk);
+            w.Key("entity_annotations"); w.Uint64(scan.entityAnnotations);
+            w.EndObject();
+
+            fprintf(stderr, "[phys_ingest] Complete: %s → %zu bond types, %zu total pairs, %d positions\n",
+                docId.c_str(), pbmData.bonds.size(), scan.totalPairs, scan.totalSlots);
             fflush(stderr);
 
             return AZStd::string(sb.GetString(), sb.GetSize());

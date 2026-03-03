@@ -32,6 +32,8 @@ set(FILES
     Source/HCPVocabBed.h
     Source/HCPEnvelopeManager.cpp
     Source/HCPEnvelopeManager.h
+    Source/HCPEntityAnnotator.cpp
+    Source/HCPEntityAnnotator.h
     Source/HCPDbConnection.cpp
     Source/HCPDbConnection.h
     Source/HCPDbUtils.h

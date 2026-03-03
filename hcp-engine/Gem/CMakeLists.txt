@@ -176,11 +176,16 @@ if(HCP_BUILD_WORKSTATION AND PAL_TRAIT_BUILD_HOST_TOOLS)
             hcpengine_workstation_files.cmake
         INCLUDE_DIRECTORIES
             PRIVATE
+                Include
                 Source
+                ${LIBPQ_INCLUDE_DIR}
+                ${LIBLMDB_INCLUDE_DIR}
         BUILD_DEPENDENCIES
             PRIVATE
                 AZ::AzToolsFramework
                 3rdParty::Qt::Network
+                ${LIBPQ_LIBRARY}
+                ${LIBLMDB_LIBRARY}
     )
 endif()
 

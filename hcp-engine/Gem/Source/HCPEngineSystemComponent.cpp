@@ -292,6 +292,12 @@ namespace HCPEngine
             }
         }
 
+        // Initialize entity annotator for multi-word entity recognition
+        if (m_vocabulary.GetLmdbEnv())
+        {
+            m_entityAnnotator.Initialize(m_vocabulary.GetLmdbEnv());
+        }
+
         // Start socket server — API for ingestion and retrieval
         bool listenAll = static_cast<bool>(hcp_listen_all);
         m_socketServer.Start(this, HCPSocketServer::DEFAULT_PORT, listenAll);

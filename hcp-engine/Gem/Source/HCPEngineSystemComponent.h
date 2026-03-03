@@ -19,6 +19,7 @@
 #include "HCPCacheMissResolver.h"
 #include "HCPVocabBed.h"          // BedManager
 #include "HCPEnvelopeManager.h"   // Envelope cache lifecycle
+#include "HCPEntityAnnotator.h"  // Multi-word entity recognition
 
 namespace HCPEngine
 {
@@ -55,6 +56,7 @@ namespace HCPEngine
         const HCPBondTable& GetCharWordBonds() const { return m_charWordBonds; }
         BedManager& GetBedManager() { return m_bedManager; }
         HCPEnvelopeManager& GetEnvelopeManager() { return m_envelopeManager; }
+        EntityAnnotator& GetEntityAnnotator() { return m_entityAnnotator; }
         bool IsEngineReady() const { return m_vocabulary.IsLoaded() && m_particlePipeline.IsInitialized(); }
 
     protected:
@@ -117,6 +119,9 @@ namespace HCPEngine
 
         // Envelope cache lifecycle — LMDB hot cache management
         HCPEnvelopeManager m_envelopeManager;
+
+        // Entity annotator — multi-word entity recognition (LMDB-backed)
+        EntityAnnotator m_entityAnnotator;
 
         // Console command registrations
         AZ_CONSOLEFUNC(HCPEngineSystemComponent, SourceIngest, AZ::ConsoleFunctorFlags::Null, "Encode a source file into the HCP pipeline");
