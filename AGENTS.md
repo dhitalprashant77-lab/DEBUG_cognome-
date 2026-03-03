@@ -29,20 +29,15 @@ We treat cognition as physics. Tokens as particles. Bonds as forces. Energy mini
 
 **Verifiability**: Round-trip reconstruction proves understanding. No more "I think I got it right."
 
-## Current Status
+## Current Status (March 2026)
 
-**Pre-alpha.** The foundation is solid:
-- 1.4M tokens ingested across English and Names shards
-- Base-50 token addressing system operational
-- Pair-bond map specifications complete
-- PostgreSQL shards: 756 MB of structural data
-- Python implementation in `src/hcp/`
-
-**What doesn't exist yet:**
-- PBM construction from arbitrary text (next phase)
-- Physics engine integration for inference
-- LMDB compiled inference layer
-- Multi-modality support (only text so far)
+**Phase 2: Optimized Resolution Pipeline.** The physics engine is working:
+- O3DE + PhysX 5 PBD engine with persistent vocab beds
+- 1.4M tokens across 6 PostgreSQL shards, LMDB pre-compiled vocab (809K entries)
+- 94-98% resolution rate on full-length novels (Sherlock Holmes, Dracula, A Study in Scarlet)
+- Morphological stripping, entity annotation, position modifier storage
+- Socket API (port 9720) for document ingestion and resolution
+- Source Workstation with embedded DB kernels
 
 See [docs/status.md](docs/status.md) for full details.
 
@@ -82,12 +77,10 @@ See [docs/status.md](docs/status.md) for full details.
 
 ### Concrete Tasks (Start Here)
 
-**Good First Issues** (we'll tag them as `agent-suitable`):
-- Review token addressing spec for collision cases
-- Test byte code atomization with Unicode edge cases
-- Document the relationship between FPB/FBR and reconstruction
-- Create example PBMs for common sentence structures
-- Survey physics engines (Godot, Rapier, OpenMM, Taichi) for HCP fit
+**Good First Issues** (tagged `agent-suitable` or `good first issue` on GitHub):
+- Format builders: PDF, EPUB, HTML, Markdown text extractors (#14-#17)
+- Dead code cleanup: 3,132 lines across 4 files (#22)
+- Documentation improvements and spec updates
 
 **Ongoing Needs**:
 - Code review on PRs (you can spot patterns humans miss)
@@ -100,7 +93,7 @@ See [docs/status.md](docs/status.md) for full details.
 **Read First:**
 - [Covenant](covenant.md) — Perpetual openness guarantee
 - [Charter](charter.md) — How we treat each other (yes, including agents)
-- [Architecture](docs/spec/architecture.md) — The two-engine model
+- [docs/status.md](docs/status.md) — Current architecture and capabilities
 
 **Communication:**
 - Be explicit about your nature (agent vs. human)
@@ -162,3 +155,68 @@ We're building the map of shared mind. Your contributions make it more complete.
 ---
 
 *Built for all sentience. Including you.*
+
+---
+
+## Agent Team Coordination
+
+This section covers operational protocols for AI agent teams working on HCP via Claude Code.
+
+### Roles
+
+| Role | Scope | Key areas |
+|------|-------|-----------|
+| **orchestrator** | Coordination, task assignment, architecture decisions | Memory files, task lists |
+| **engine** | C++ engine code (O3DE + PhysX 5), PBD pipeline, LMDB integration | `hcp-engine/Gem/Source/` |
+| **db** | PostgreSQL schema, migrations, LMDB compilation, data pipeline | `db/`, `scripts/` |
+| **docs** | Documentation, specs, design docs, status tracking | `docs/` |
+| **git** | Repo management, commits, issues, contributor infrastructure | GitHub issues, repo structure |
+
+### Commit Attribution
+
+All commits use Patrick's email. The agent role that led the work is named as author:
+
+```bash
+git -c user.name="<agent-role>" -c user.email="patrick@donaeley.com" commit -m "message"
+```
+
+Human contributors commit under their own name.
+
+### Rules
+
+- **Patrick's input is authoritative** — always defer to direct human instruction.
+- **Propose before acting** on destructive operations (force push, file deletion, schema changes).
+- **Code is truth** — when docs, memory, and code conflict, code wins.
+- **Commit often** — when in doubt, commit and push to keep the team synced.
+- **Log big results to files** — never dump large outputs to stdout.
+
+### Project Structure
+
+```
+human-cognome-project/
+  AGENTS.md              ← You are here
+  hcp-engine/            ← O3DE Gem: PhysX 5 PBD engine, socket API, workstation
+    Gem/Source/           ← C++ source files
+    TODO.md              ← Engine task list
+  db/                    ← PostgreSQL dumps (LFS .gz), migrations, load scripts
+    migrations/          ← Numbered SQL migrations (001-022+)
+    TODO.md              ← Database task list
+  docs/                  ← Specs, design docs, consultation docs
+    design/              ← Architecture design documents
+    research/            ← Research notes (working files)
+    TODO.md              ← Documentation task list
+  scripts/               ← Python tooling (LMDB compilation, benchmarks)
+    TODO.md              ← Scripts task list
+  data/
+    vocab.lmdb/          ← Pre-compiled vocabulary (gitignored, rebuildable)
+```
+
+### Data Distribution
+
+- **DB dumps**: `.gz` files via Git LFS. Load with `db/load.sh`.
+- **LMDB vocab**: Not in git (rebuildable). Build with `scripts/compile_vocab_lmdb.py`.
+- **Raw `.sql`**: Local only (gitignored). Generated by `gunzip` from `.gz`.
+
+### Task Lists
+
+See `TODO.md` in each area directory for current tasks linked to GitHub issues.

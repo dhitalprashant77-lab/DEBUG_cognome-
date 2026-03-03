@@ -1,128 +1,75 @@
 # HCP Engine — TODO
 
-Last updated: 2026-02-25
+Last updated: 2026-03-03
 
 ## Legend
 
-- **[BLOCKED]** — waiting on another task or person
+- **[BLOCKED]** — waiting on another task or decision
 - **[READY]** — can be picked up now
 - **[IN PROGRESS]** — someone is working on it
-- **[DONE]** — completed, kept for context until next cleanup
 
 ---
 
-## Phase 1: Document Processing Workstation
+## Active: Phase 2 Optimized Resolution Pipeline
 
-### Engine Tasks
+### Dead Code Cleanup — [GitHub #22](https://github.com/Human-Cognome-Project/human-cognome-project/issues/22)
 
-- [ ] **[READY]** Create HCPDocumentBuilder skeleton — builder + component + module, register with Asset Processor, handle `.txt` files, emit dummy product. Verify AP discovers it.
-- [ ] **[READY]** Create HCPDocumentBuilderVocab — Postgres-backed vocabulary reader with same interface as HCPVocabulary (LookupChunk, CheckContinuation, LookupChar). Verify lookups match LMDB.
-- [ ] **[BLOCKED]** Wire tokenizer into ProcessJob — reuse HCPTokenizer with Postgres-backed vocab. Blocked on builder skeleton + vocab.
-- [ ] **[BLOCKED]** Position map product format — binary format: token stream + base-50 positions + metadata header. Blocked on tokenizer integration.
-- [ ] **[READY]** Add `.Builders` CMake target — separate GEM_MODULE linking AssetBuilderSDK + libpq. Does NOT link PhysX5, LMDB, or CUDA.
-- [ ] **[READY]** Create `hcpengine_builder_files.cmake` — source list for builder target.
-- [ ] **[BLOCKED]** Scan folder configuration — point Asset Processor at `data/gutenberg/texts/`. Blocked on working builder.
-- [ ] **[BLOCKED]** End-to-end verification — tokenization output matches self-test (Yellow Wallpaper: 10,482 tokens, 20,200 slots). Blocked on full pipeline.
+- [ ] **[READY]** Strip dead HCPWriteKernel class from HCPStorage.h/cpp (~1,570 lines). Keep live entity cross-ref functions. Consider moving entity functions to own file.
+- [ ] **[READY]** Remove dead TierAssembly + ChamberManager + ResolutionChamber from HCPResolutionChamber.h/cpp (~1,100 lines). Keep shared structs (ResolutionManifest, MorphBit, ResolutionResult, CharRun, StreamRunSlot). Consider renaming file.
+- [ ] **[READY]** Remove HCPDetectionScene.h/cpp (421 lines entirely dead). Remove from hcpengine_files.cmake.
+- [ ] **[READY]** Remove dead forward sub-db code from HCPVocabulary (~35 lines).
 
-### DB Tasks
+### Performance
 
-- [ ] **[READY]** Confirm Postgres read access pattern for builder — builder runs inside Asset Processor process, needs w2t, c2t, l2t, forward table access.
-- [ ] **[READY]** Fix marker table PK collision — control tokens share `(t_p3, t_p4)`, needs t_p5 column added to `doc_marker_positions`.
-- [ ] **[READY]** Confirm forward table is populated for full vocabulary.
-- [ ] **[BLOCKED]** Review position map product format — confirm sufficient for aggregation layer (PBM derived on the fly). Blocked on format spec.
+- [ ] **[READY]** Triple scene pipeline pipelining — [GitHub #24](https://github.com/Human-Cognome-Project/human-cognome-project/issues/24). State machine refactor of BedManager::ResolvePass for GPU/CPU overlap. ~50% Phase 2 speedup target.
+- [ ] **[READY]** Label propagation — if a word appears as a Label anywhere in text, restore firstCap on all suppressed instances of the same token_id. Not yet implemented.
 
----
+### Bugs
 
-## Phase 2: Document Reconstruction
+- [ ] **[BLOCKED]** Entity cross-ref OR matching — [GitHub #23](https://github.com/Human-Cognome-Project/human-cognome-project/issues/23). GetFictionEntitiesForDocument matches ANY name token instead of ALL. Blocked on entity data cleanup.
+- [ ] **[READY]** Service file binary mismatch — [GitHub #25](https://github.com/Human-Cognome-Project/human-cognome-project/issues/25). hcp-engine.service references wrong binary name + has restart-loop workaround.
 
-- [x] **[DONE]** PBM derivation function — DerivePBM: positions in, bond counts out. O(n) scan, ~16ms for 10K tokens.
-- [x] **[DONE]** Reconstruction proof — EXACT MATCH lossless round-trip on 4 Gutenberg texts (52KB–807KB).
-- [x] **[DONE]** PBM storage — StorePBM writes to hcp_fic_pbm (starters, word bonds, char bonds, var bonds).
-- [x] **[DONE]** Document-local vars — decimal pair IDs, pbm_docvars, mint_docvar(), pbm_var_bonds.
-- [x] **[DONE]** Docvar classification — ClassifyVar() at ingest (uri_metadata, sic, proper, lingo). Backfill applied to existing data.
-- [x] **[DONE]** Editor panel — HCP Asset Manager dock widget: Info, Metadata, Entities, Vars, Bonds, Text tabs.
-- [x] **[DONE]** Entity cross-reference — fiction entities via starter token matching, NF author via metadata/Gutenberg lookup.
-- [x] **[DONE]** Vars tab with classification display — category styling (bold/italic/grey), group and suggested entity columns.
-- [x] **[DONE]** Cross-link navigation — Entity↔Var drill-down with breadcrumb, filtered views.
-- [ ] **[READY]** Position map reader as shared module — currently embedded in self-test path. Extract for reuse.
+### Infrastructure
+
+- [ ] **[READY]** Persist bond tables as files — [GitHub #5](https://github.com/Human-Cognome-Project/human-cognome-project/issues/5). Bond compiler still hits Postgres on startup (~3s). Store compiled tables as binary files.
 
 ---
 
-## Next Up: Metadata & Sub-Languages
+## Workstation
 
-- [ ] **[READY]** JSON metadata processing — alternate interpretation streams (Patrick to define scope)
-- [ ] **[READY]** First specialty sub-language — related to JSON kernel ops
-- [ ] **[READY]** Kernel operation tagging — stack-based assembly
-- [ ] **[READY]** Non-space-delineated language support — greedy approach, not space-based
-
----
-
-## Phase 3: Comparison Tool
-
-- [ ] **[BLOCKED]** Boilerplate/plagiarism detector — two documents as parallel particle streams, magnetic forces, convergence clustering. First real PhysX use case. Blocked on Phase 2.
-
----
-
-## Editor Panel Enhancements
-
-- [ ] **[READY]** Var positions in panel — display position data for each docvar occurrence in the Vars tab. Lead-in to click-to-highlight: selecting a var in the Vars tab highlights all its occurrences in the Text tab. Position data already stored via `StorePositions()`; needs mapping from var tokens to their positions in the document stream.
-- [ ] **[READY]** Proper candidate detection in tokenizer — flag out-of-place capitalization (non-sentence-start uppercase) as label/proper candidates during tokenization. Contiguous label tokens form a group, compared against Dramatis Personae and entity lists. 100% match → use entity token. No match → strip bridge words (of/the/von/de) and try compound resolution. Unresolved groups become pending docvar_groups for panel review.
-- [ ] **[READY]** Var category color legend — small key in the Vars tab header showing what bold/italic/grey mean.
-- [ ] **[READY]** Var count summary in Info tab — add var counts by category (e.g., "Vars: 12 proper, 30 sic, 5 uri, 2 lingo") to the document info display.
-- [ ] **[READY]** Group highlight in Vars tab — clicking a var with a group_id highlights all sibling vars in the same group.
-- [ ] **[READY]** Bond→Entity indicator — if a bond's token matches a known entity name token, show an entity icon/indicator in the Bonds tab.
-- [ ] **[READY]** Alias grouping review workflow — confirm/reject/promote groups in the Vars tab panel. Update docvar_groups.status, optionally promote to entity.
+- [ ] **[READY]** Var positions in panel — display position data for each docvar occurrence in the Vars tab.
+- [ ] **[READY]** Proper candidate detection in tokenizer — flag out-of-place capitalization during tokenization.
+- [ ] **[READY]** Alias grouping review workflow — confirm/reject/promote groups in the Vars tab panel.
 
 ---
 
 ## Format Builders (contributor tasks)
 
-These follow the reference `.txt` implementation. See AGENTS.md for the pattern.
-
-- [ ] **[BLOCKED]** PDF builder — text extraction via poppler/pdftotext. Blocked on reference implementation.
-- [ ] **[BLOCKED]** EPUB builder — unzip + XHTML parsing. Blocked on reference implementation.
-- [ ] **[BLOCKED]** HTML builder — markup stripping, structure preservation. Blocked on reference implementation.
-- [ ] **[BLOCKED]** Markdown builder — may share `.txt` builder with minimal additions. Blocked on reference implementation.
-- [ ] **[BLOCKED]** Wikipedia dump builder — MediaWiki markup parsing. Blocked on reference implementation.
-
----
-
-## Infrastructure
-
-- [ ] **[READY]** SQLite vocabulary backend for standalone distribution — builder currently assumes Postgres (libpq). Standalone Asset Processor packages should query a SQLite dump instead, removing the Postgres server dependency for contributors doing document processing.
-- [ ] **[READY]** Root-level AGENTS.md / CLAUDE.md that references subdirectory files.
-- [ ] **[READY]** Contributor setup documentation — SDK install, project build, Postgres setup.
-
----
-
-## Good First Issues (contributor-friendly)
-
-These are smaller, well-defined tasks with clear scope. Good for getting familiar with the codebase.
-
-- [ ] **[READY]** Bullet char `•` — add as a label entry in hcp_english (`layer = 'label'`). Currently vars in every document. One DB insert + verify tokenizer resolves it.
-- [ ] **[READY]** Numbers need `<sic>` wrapper support — numeric tokens (years, counts) should be wrapped in a sic-style marker so they're explicitly flagged as literal values, not vocabulary items.
-- [ ] **[READY]** Web address discriminator — URLs (www.gutenberg.org etc.) currently take the dot-value fast path to var. Add a specific discriminator that detects web address patterns and routes them to a dedicated sub-language entry set (future: web address language shard). Note: var classification now tags these as `uri_metadata` at storage time, but the tokenizer-level routing is still needed.
-- [ ] **[READY]** Var compound back-check — when a new var is created during tokenization (e.g. "Tellson"), launch a lightweight check against existing vars in the document to see if any are compound forms (e.g. "Tellson's" = var(Tellson) + 's). Resolve the compound and update the var cache. Reduces var count for proper nouns that only appear in possessive/affixed form.
-- [ ] **[READY]** Persist bond tables as files — char→word and byte→char bond tables currently recompile from Postgres on first run, then cache in hcp_temp. Store compiled tables as binary files in the engine area so startup skips Postgres entirely. Patrick approved storing in engine area.
-- [ ] **[READY]** Tellson / Barsad / Stryver / Gaspard — missing from hcp_english as labels. Librarian missed these Dickens proper nouns. Add as `layer = 'label'` entries. Check other Gutenberg test texts for similar gaps.
-- [ ] **[READY]** Edge case tokens: `I_'m`, `-_my_self`, `trademark/copyright` — investigate why these surface forms appear. Likely underscore artifacts from Gutenberg formatting or slash not handled by dash split. Fix the tokenizer path or add appropriate handling.
-
----
-
-## Cleanup
-
-- [ ] **[READY]** Purge "7 force types" from repo docs — memory files done, research docs and specs still contain stale references. Files: `openmm-evaluation.md`, `english-force-patterns.md`, `force-pattern-db-requirements.md`, `force-pattern-db-review.md`, `concept-mesh-decomposition.md`, `particle-vs-md-operations.md`, `namespace-reference.md`, `006_force_patterns.sh`, `006a_force_infrastructure_tokens.sql`.
-- [ ] **[READY]** Remove socket server once Asset Builder pipeline is proven and stable.
+- [ ] **[READY]** PDF text extractor — [GitHub #14](https://github.com/Human-Cognome-Project/human-cognome-project/issues/14)
+- [ ] **[READY]** EPUB text extractor — [GitHub #15](https://github.com/Human-Cognome-Project/human-cognome-project/issues/15)
+- [ ] **[READY]** HTML text extractor — [GitHub #16](https://github.com/Human-Cognome-Project/human-cognome-project/issues/16)
+- [ ] **[READY]** Markdown text extractor — [GitHub #17](https://github.com/Human-Cognome-Project/human-cognome-project/issues/17)
+- [ ] **[READY]** Wikipedia dump processor — [GitHub #18](https://github.com/Human-Cognome-Project/human-cognome-project/issues/18)
 
 ---
 
 ## Future (not yet planned in detail)
 
+- Triple scene pipeline (design exists, implementation pending)
 - Custom physics engine (~65 core forces, linguist-defined)
 - Conversation levels (documents as entities in level workspaces)
-- HCPDocumentAsset + runtime handler
-- LoD tiers (multiple aggregation levels per document)
-- Vocabulary inspector tool
-- Tokenization tester tool
 - Language shard system (new languages via vocabulary + force constants)
 - Texture engine (linguistic force bonding — surface language rules)
+
+---
+
+## Completed (recent)
+
+- [x] WriteKernel decomposition — monolith split into 7 kernel modules (615bbfc)
+- [x] Persistent vocab beds — 15 PBD systems replace 175 per-batch chambers (63750f5)
+- [x] Morphological resolution — MorphBit field, RunTag routing, inflection stripping (650cea0)
+- [x] Entity annotator — multi-word entity recognition from LMDB (8e9b3f6)
+- [x] Manifest scanner — single-pass PBM from resolution manifest (fe573fe)
+- [x] phys_ingest endpoint — full ingest pipeline via socket API (8e9b3f6)
+- [x] Workstation overhaul — socket client, embedded DB kernels, systemd service (3b86915)
+- [x] inline constexpr cleanup — ODR fix, DbUtils consolidation (4109085)
