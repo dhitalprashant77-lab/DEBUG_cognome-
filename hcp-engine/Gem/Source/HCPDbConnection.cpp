@@ -5,8 +5,10 @@
 
 namespace HCPEngine
 {
-    static constexpr const char* DEFAULT_CONNINFO =
+namespace DbConn_Detail {
+    constexpr const char* DEFAULT_CONNINFO =
         "dbname=hcp_fic_pbm user=hcp password=hcp_dev host=localhost port=5432";
+} // DbConn_Detail
 
     HCPDbConnection::~HCPDbConnection()
     {
@@ -20,7 +22,7 @@ namespace HCPEngine
             Disconnect();
         }
 
-        m_conn = PQconnectdb(connInfo ? connInfo : DEFAULT_CONNINFO);
+        m_conn = PQconnectdb(connInfo ? connInfo : DbConn_Detail::DEFAULT_CONNINFO);
         if (PQstatus(m_conn) != CONNECTION_OK)
         {
             AZLOG_ERROR("HCPDbConnection: Connection failed: %s", PQerrorMessage(m_conn));
@@ -29,7 +31,7 @@ namespace HCPEngine
             return false;
         }
 
-        AZLOG_INFO("HCPDbConnection: Connected to %s", connInfo ? connInfo : DEFAULT_CONNINFO);
+        AZLOG_INFO("HCPDbConnection: Connected to %s", connInfo ? connInfo : DbConn_Detail::DEFAULT_CONNINFO);
         return true;
     }
 

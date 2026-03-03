@@ -1,4 +1,5 @@
 #include "HCPStorage.h"
+#include "HCPDbUtils.h"
 
 #include <AzCore/Console/ILogger.h>
 #include <AzCore/std/string/conversions.h>
@@ -8,121 +9,10 @@
 
 namespace HCPEngine
 {
-    static constexpr const char* DEFAULT_CONNINFO =
+namespace Storage_Detail {
+    constexpr const char* DEFAULT_CONNINFO =
         "dbname=hcp_fic_pbm user=hcp password=hcp_dev host=localhost port=5432";
-
-    // Var request token prefix — must match HCPVocabulary.h VAR_REQUEST
-    static constexpr const char* VAR_PREFIX = "AA.AE.AF.AA.AC";
-    static constexpr size_t VAR_PREFIX_LEN = 14;  // strlen("AA.AE.AF.AA.AC")
-
-    // Check if a token is a var request (prefix + space + surface form)
-    static bool IsVarToken(const AZStd::string& token)
-    {
-        return token.size() > VAR_PREFIX_LEN + 1 &&
-               token.starts_with(VAR_PREFIX) &&
-               token[VAR_PREFIX_LEN] == ' ';
-    }
-
-    // Extract the surface form from a var token (everything after "AA.AE.AF.AA.AC ")
-    static AZStd::string VarSurface(const AZStd::string& token)
-    {
-        return AZStd::string(token.data() + VAR_PREFIX_LEN + 1,
-                             token.size() - VAR_PREFIX_LEN - 1);
-    }
-
-    // Classify a docvar surface form into a category.
-    // Detection order: uri_metadata → sic → proper → lingo (first match wins).
-    static const char* ClassifyVar(const AZStd::string& surface)
-    {
-        if (surface.empty()) return "lingo";
-
-        // uri_metadata: starts with http://, https://, www., or contains ://
-        if (surface.starts_with("http://") || surface.starts_with("https://") ||
-            surface.starts_with("www.") || surface.find("://") != AZStd::string::npos)
-        {
-            return "uri_metadata";
-        }
-
-        // sic: contains digits or non-alpha/non-space/non-hyphen/non-apostrophe chars
-        for (char c : surface)
-        {
-            if (c >= '0' && c <= '9')
-                return "sic";
-            if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-                  c == ' ' || c == '-' || c == '\''))
-                return "sic";
-        }
-
-        // proper: first character is uppercase
-        if (surface[0] >= 'A' && surface[0] <= 'Z')
-            return "proper";
-
-        // lingo: everything else
-        return "lingo";
-    }
-
-    // Base-50 pair encoding (value 0-2499 → 2 chars)
-    static const char B50[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx";
-
-    static AZStd::string EncodePairStr(int value)
-    {
-        if (value < 0) value = 0;
-        if (value >= 2500) value = 2499;
-        char buf[3];
-        buf[0] = B50[value / 50];
-        buf[1] = B50[value % 50];
-        buf[2] = '\0';
-        return AZStd::string(buf);
-    }
-
-    // Base-50 position encoding: position → 4 chars (two pairs)
-    // pair1 = position / 2500, pair2 = position % 2500
-    // Max position: 2499 * 2500 + 2499 = 6,249,999
-    static void EncodePosition(int position, char out[4])
-    {
-        int pair1 = position / 2500;
-        int pair2 = position % 2500;
-        out[0] = B50[pair1 / 50];
-        out[1] = B50[pair1 % 50];
-        out[2] = B50[pair2 / 50];
-        out[3] = B50[pair2 % 50];
-    }
-
-    static int DecodeB50Char(char c)
-    {
-        if (c >= 'A' && c <= 'Z') return c - 'A';
-        if (c >= 'a' && c <= 'x') return 26 + (c - 'a');
-        return 0;
-    }
-
-    static int DecodePosition(const char* p)
-    {
-        int pair1 = DecodeB50Char(p[0]) * 50 + DecodeB50Char(p[1]);
-        int pair2 = DecodeB50Char(p[2]) * 50 + DecodeB50Char(p[3]);
-        return pair1 * 2500 + pair2;
-    }
-
-    // Split "AB.AB.CD.AH.xN" → parts[0]="AB", parts[1]="AB", parts[2]="CD", parts[3]="AH", parts[4]="xN"
-    // Only splits on the first 4 dots — everything after the 4th dot goes into parts[4].
-    // This handles var tokens like "AA.AE.AF.AA.AC 1.E.8" where form text contains dots.
-    static void SplitTokenId(const AZStd::string& tokenId, AZStd::string parts[5])
-    {
-        int idx = 0;
-        size_t start = 0;
-        for (size_t i = 0; i < tokenId.size() && idx < 4; ++i)
-        {
-            if (tokenId[i] == '.')
-            {
-                parts[idx++] = AZStd::string(tokenId.data() + start, i - start);
-                start = i + 1;
-            }
-        }
-        // Remainder (including any further dots) goes into the last part
-        if (start <= tokenId.size())
-        {
-            parts[idx] = AZStd::string(tokenId.data() + start, tokenId.size() - start);
-        }
-    }
+} // Storage_Detail
 
     // ---- HCPWriteKernel ----
 
@@ -138,7 +28,7 @@ namespace HCPEngine
             Disconnect();
         }
 
-        m_conn = PQconnectdb(connInfo ? connInfo : DEFAULT_CONNINFO);
+        m_conn = PQconnectdb(connInfo ? connInfo : Storage_Detail::DEFAULT_CONNINFO);
         if (PQstatus(m_conn) != CONNECTION_OK)
         {
             AZLOG_ERROR("HCPWriteKernel: Connection failed: %s", PQerrorMessage(m_conn));
@@ -147,7 +37,7 @@ namespace HCPEngine
             return false;
         }
 
-        AZLOG_INFO("HCPWriteKernel: Connected to %s", connInfo ? connInfo : DEFAULT_CONNINFO);
+        AZLOG_INFO("HCPWriteKernel: Connected to %s", connInfo ? connInfo : Storage_Detail::DEFAULT_CONNINFO);
         return true;
     }
 
@@ -528,41 +418,6 @@ namespace HCPEngine
         }
 
         return docId;
-    }
-
-    // Encode sparse modifiers: only non-zero entries as [pos_b50(4) + mod_b50(4)] pairs
-    static AZStd::string EncodeSparseModifiers(
-        const AZStd::vector<int>& posList,
-        const AZStd::vector<AZ::u32>& allModifiers,
-        const AZStd::vector<int>& allPositions,
-        const AZStd::vector<AZStd::string>& allTokenIds,
-        const AZStd::string& tokenId)
-    {
-        if (allModifiers.empty()) return {};
-
-        AZStd::string encoded;
-        // For each position in this token's position list, find its modifier
-        for (int pos : posList)
-        {
-            // Find the index in the global arrays where this token+position occurs
-            for (size_t i = 0; i < allTokenIds.size(); ++i)
-            {
-                if (allTokenIds[i] == tokenId && allPositions[i] == pos)
-                {
-                    if (i < allModifiers.size() && allModifiers[i] != 0)
-                    {
-                        char posBuf[4];
-                        EncodePosition(pos, posBuf);
-                        char modBuf[4];
-                        EncodePosition(static_cast<int>(allModifiers[i]), modBuf);
-                        encoded.append(posBuf, 4);
-                        encoded.append(modBuf, 4);
-                    }
-                    break;
-                }
-            }
-        }
-        return encoded;
     }
 
     bool HCPWriteKernel::StorePositions(

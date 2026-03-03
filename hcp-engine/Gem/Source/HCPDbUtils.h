@@ -7,12 +7,12 @@
 namespace HCPEngine
 {
     // Var request token prefix — must match HCPVocabulary.h VAR_REQUEST
-    static constexpr const char* VAR_PREFIX = "AA.AE.AF.AA.AC";
-    static constexpr size_t VAR_PREFIX_LEN = 14;  // strlen("AA.AE.AF.AA.AC")
+    inline constexpr const char* VAR_PREFIX = "AA.AE.AF.AA.AC";
+    inline constexpr size_t VAR_PREFIX_LEN = 14;  // strlen("AA.AE.AF.AA.AC")
 
     // ---- Base-50 encoding ----
 
-    static constexpr const char B50[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx";
+    inline constexpr const char B50[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx";
 
     inline AZStd::string EncodePairStr(int value)
     {

@@ -16,9 +16,9 @@ namespace HCPEngine
 {
     // Base-50 alphabet — matches Python hcp.core.token_id.ALPHABET
     // A-N, P-Z, a-n, p-z (52 Latin letters minus O/o = 50)
-    static constexpr const char BASE50_ALPHABET[] =
+    inline constexpr const char BASE50_ALPHABET[] =
         "ABCDEFGHIJKLMNPQRSTUVWXYZabcdefghijklmnpqrstuvwxyz";
-    static constexpr int BASE50 = 50;
+    inline constexpr int BASE50 = 50;
 
     /// Encode an integer (0-2499) as a 2-char base-50 pair.
     inline AZStd::string EncodePairB50(int value)

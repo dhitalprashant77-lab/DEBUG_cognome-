@@ -29,7 +29,7 @@ namespace HCPEngine
             return false;
         }
 
-        mdb_env_set_maxdbs(m_env, 10);
+        mdb_env_set_maxdbs(m_env, 48);  // 6 core + 30 vbed + 1 manifest + 4 entity + headroom
         mdb_env_set_mapsize(m_env, 1ULL * 1024 * 1024 * 1024); // 1 GB virtual
 
         rc = mdb_env_open(m_env, lmdbPath, 0, 0644);

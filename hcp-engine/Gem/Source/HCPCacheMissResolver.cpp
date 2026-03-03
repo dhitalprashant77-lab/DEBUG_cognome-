@@ -1,4 +1,5 @@
 #include "HCPCacheMissResolver.h"
+#include "HCPDbUtils.h"
 
 #include <lmdb.h>
 #include <libpq-fe.h>
@@ -8,9 +9,6 @@
 
 namespace HCPEngine
 {
-    // Var request token prefix — keys starting with this route to VarHandler
-    static constexpr const char* VAR_PREFIX = "AA.AE.AF.AA.AC";
-    static constexpr size_t VAR_PREFIX_LEN = 14; // strlen("AA.AE.AF.AA.AC")
 
     // ---- CacheMissResolver ----
 
