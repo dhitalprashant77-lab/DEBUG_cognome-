@@ -6,6 +6,9 @@
 #include <AzCore/std/string/string.h>
 #include "HCPWordSuperpositionTrial.h"  // CharRun
 
+// Forward declare libpq connection type (avoids libpq-fe.h in header)
+typedef struct pg_conn PGconn;
+
 // Forward declarations — full PhysX headers only in .cpp
 namespace physx
 {
@@ -22,6 +25,26 @@ namespace HCPEngine
     class HCPVocabulary;
     class HCPBondTable;
 
+    // ---- Morphological bit field (16-bit) ----
+    // Each bit records one inflection/contraction applied during resolution.
+    // Stored as positional modifiers alongside token_id — zero for bare tokens.
+    namespace MorphBit
+    {
+        static constexpr AZ::u16 PLURAL   = 1 << 0;   // -s (plural)
+        static constexpr AZ::u16 POSS     = 1 << 1;   // 's (possessive)
+        static constexpr AZ::u16 POSS_PL  = 1 << 2;   // s' (plural possessive)
+        static constexpr AZ::u16 PAST     = 1 << 3;   // -ed
+        static constexpr AZ::u16 PROG     = 1 << 4;   // -ing
+        static constexpr AZ::u16 THIRD    = 1 << 5;   // -s (3rd person singular)
+        static constexpr AZ::u16 NEG      = 1 << 6;   // n't
+        static constexpr AZ::u16 COND     = 1 << 7;   // 'd (would/had)
+        static constexpr AZ::u16 WILL     = 1 << 8;   // 'll
+        static constexpr AZ::u16 HAVE     = 1 << 9;   // 've
+        static constexpr AZ::u16 BE       = 1 << 10;  // 're
+        static constexpr AZ::u16 AM       = 1 << 11;  // 'm
+        // Bits 12-15 reserved
+    }
+
     // ---- Constants (empirical, tunable) ----
 
     static constexpr float RC_Z_SCALE = 10.0f;
@@ -33,10 +56,14 @@ namespace HCPEngine
     static constexpr float RC_RUN_X_GAP = 2.0f;
     static constexpr float RC_DT = 1.0f / 60.0f;
     static constexpr int RC_SETTLE_STEPS = 60;
-    static constexpr int RC_MAX_TIERS = 4;          // Tiers 0,1,2 + var fallback
-    static constexpr AZ::u32 RC_TIER_0_MAX = 100;   // Words per tier (tunable)
-    static constexpr AZ::u32 RC_TIER_1_MAX = 200;
-    static constexpr AZ::u32 RC_TIER_2_MAX = 500;
+    static constexpr AZ::u32 RC_VOCAB_PER_PHASE = 2000;  // Vocab entries per phase slice (larger = fewer phases, fewer simulate() rounds)
+
+    // Legacy tier constants — used by TierAssembly::AssignTiers (Postgres path).
+    // Will be removed when BedManager switches to LMDB data source.
+    static constexpr int RC_MAX_TIERS = 4;
+    static constexpr AZ::u32 RC_TIER_0_MAX = 500;
+    static constexpr AZ::u32 RC_TIER_1_MAX = 1500;
+    static constexpr AZ::u32 RC_TIER_2_MAX = 5000;
     static constexpr AZ::u32 RC_STANDARD_BUFFER_CAPACITY = 8192;
     static constexpr AZ::u32 RC_BATCH_PARTICLE_BUDGET = 100000;  // Max particles per batch (VRAM safety)
 
@@ -48,6 +75,7 @@ namespace HCPEngine
         AZStd::string word;       // Lowercase word form
         AZStd::string tokenId;    // Resolved token ID
         AZ::u32 bondCount;        // Aggregate PBM bond score (sum of adjacent char-pair bonds)
+        AZ::u32 freqRank;         // Corpus frequency rank (1 = most frequent, 0 = unranked)
         AZ::u32 tierIndex;        // Assigned tier (0 = highest frequency)
     };
 
@@ -76,8 +104,19 @@ namespace HCPEngine
         //! "there" = GetBondStrength("t","h") + GetBondStrength("h","e") + ...
         void Build(const HCPBondTable& bondTable, const HCPVocabulary& vocab);
 
+        //! Build tiered vocabulary from Postgres via particle_key queries.
+        //! Targeted queries per (firstChar, length) bucket instead of full vocab scan.
+        //! Apostrophe/hyphen words routed to separate punctuation bucket maps.
+        void BuildFromDatabase(PGconn* conn, const HCPBondTable& bondTable);
+
         //! Look up the vocabulary bucket for a given word length and first character.
         const ChamberVocab* GetBucket(AZ::u32 wordLength, char firstChar) const;
+
+        //! Get all buckets for a given word length (all firstChar groups).
+        AZStd::vector<const ChamberVocab*> GetBucketsForLength(AZ::u32 wordLength) const;
+
+        //! Get all word lengths that have at least one bucket, sorted descending.
+        AZStd::vector<AZ::u32> GetActiveWordLengths() const;
 
         size_t BucketCount() const { return m_buckets.size(); }
         size_t TotalWords() const { return m_totalWords; }
@@ -86,9 +125,18 @@ namespace HCPEngine
 
         static AZ::u32 MakeBucketKey(AZ::u32 len, char firstChar);
 
+        //! Punctuation-bucketed vocab (apostrophe/hyphen words from BuildFromDatabase).
+        const auto& GetApostropheBuckets() const { return m_apostropheBuckets; }
+        const auto& GetHyphenBuckets() const { return m_hyphenBuckets; }
+
     private:
 
+        //! Sort bucket by bondCount, truncate to tier capacity, assign tier indices.
+        void AssignTiers(ChamberVocab& bucket);
+
         AZStd::unordered_map<AZ::u32, ChamberVocab> m_buckets;
+        AZStd::unordered_map<char, ChamberVocab> m_apostropheBuckets;
+        AZStd::unordered_map<char, ChamberVocab> m_hyphenBuckets;
         size_t m_totalWords = 0;
     };
 
@@ -109,6 +157,8 @@ namespace HCPEngine
         AZStd::string matchedWord;
         AZStd::string matchedTokenId;
         AZ::u32 tierResolved = 0xFF;  // Which tier resolved it (0xFF = unresolved)
+        bool firstCap = false;     // Positional cap data from original CharRun
+        bool allCaps = false;
     };
 
     //! Tracking slot for a vocab word in the chamber buffer.
@@ -122,13 +172,25 @@ namespace HCPEngine
     };
 
     //! Result for a single run's resolution.
+    //! The manifest is the train manifest — each position carries its payload:
+    //! token_id + morph bits + cap flags. runIndex ties back to document order.
     struct ResolutionResult
     {
         AZStd::string runText;
         AZStd::string matchedWord;
         AZStd::string matchedTokenId;
         AZ::u32 tierResolved = 0xFF;  // 0xFF = unresolved
+        AZ::u32 runIndex = 0;          // Index into original CharRun array (document order)
         bool resolved = false;
+
+        // Morphological + capitalization modifiers (positional, zero for bare tokens)
+        AZ::u16 morphBits = 0;     // MorphBit flags (inflection/contraction applied)
+        bool firstCap = false;      // First char was uppercase (Label pattern)
+        bool allCaps = false;       // All chars were uppercase (e.g. "NASA")
+
+        // Entity annotation (non-empty = part of a recognized multi-word entity)
+        AZStd::string entityId;         // Entity token_id (e.g. "uA.AA.AA.AA.AA")
+        AZ::u8 entityNameGroup = 0;     // Which name variant matched (0=primary)
     };
 
     //! Full manifest from a resolution pass.

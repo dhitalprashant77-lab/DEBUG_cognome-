@@ -222,6 +222,10 @@ namespace HCPEngine
         // is treated as sentence-initial.
         AZ::u32 lastPrecedingCodepoint = '\n';
 
+        // The codepoint that triggered the current flush (run boundary).
+        // Used to detect single-char + trailing period (initials/markers).
+        AZ::u32 boundaryCodepoint = 0;
+
         auto FlushRun = [&]()
         {
             if (!inRun || currentCodepoints.empty())
@@ -292,6 +296,72 @@ namespace HCPEngine
                     run.capMask = AZStd::move(adjustedUpper);
                 }
 
+                // ---- Transform layer tagging ----
+                // Detect patterns that route around PBD or get special treatment.
+
+                // Single-char "I" — intrinsically capitalized, never suppressed.
+                // Detection: single codepoint that was uppercase I.
+                if (charIdx == 1 && core == "i" && adjustedUpper.size() == 1)
+                {
+                    run.tag = RunTag::SingleChar;
+                    run.firstCap = true;  // Intrinsic — overrides any suppression
+                    run.allCaps = false;
+                    run.capMask.clear();
+                    runs.push_back(run);
+                    inRun = false;
+                    currentCodepoints.clear();
+                    return;
+                }
+
+                // Single-char "a" — always lowercase, pre-assign.
+                if (charIdx == 1 && core == "a")
+                {
+                    run.tag = RunTag::SingleChar;
+                    run.firstCap = false;
+                    run.allCaps = false;
+                    run.capMask.clear();
+                    runs.push_back(run);
+                    inRun = false;
+                    currentCodepoints.clear();
+                    return;
+                }
+
+                // Single alpha char followed by period — initial/section marker.
+                // The letter IS the token (e.g. "E." in "1.E.1", "S." in "S. Weir").
+                if (charIdx == 1 && core[0] >= 'a' && core[0] <= 'z' && boundaryCodepoint == '.')
+                {
+                    run.tag = RunTag::SingleChar;
+                    runs.push_back(run);
+                    inRun = false;
+                    currentCodepoints.clear();
+                    return;
+                }
+
+                // Numeric — all digits (no letters). Tag and skip PBD.
+                {
+                    bool allDigits = true;
+                    for (size_t ci = 0; ci < core.size(); ++ci)
+                    {
+                        char ch = core[ci];
+                        if (ch < '0' || ch > '9')
+                        {
+                            allDigits = false;
+                            break;
+                        }
+                    }
+                    if (allDigits && !core.empty())
+                    {
+                        run.tag = RunTag::Numeric;
+                        run.firstCap = false;
+                        run.allCaps = false;
+                        run.capMask.clear();
+                        runs.push_back(run);
+                        inRun = false;
+                        currentCodepoints.clear();
+                        return;
+                    }
+                }
+
                 // Capitalization suppression: if preceded by sentence-ending punct
                 // or at stream start, caps are positional (not intrinsic Labels).
                 // Clear firstCap and allCaps — they're derivable from position.
@@ -325,6 +395,7 @@ namespace HCPEngine
             // Unsettled codepoint → run boundary
             if (!collapse.settled)
             {
+                boundaryCodepoint = 0;
                 FlushRun();
                 continue;
             }
@@ -334,6 +405,7 @@ namespace HCPEngine
             // Settled whitespace → run boundary
             if (IsWhitespaceCodepoint(cp))
             {
+                boundaryCodepoint = 0;
                 FlushRun();
                 // Whitespace doesn't change the "preceding punct" signal
                 continue;
@@ -343,6 +415,7 @@ namespace HCPEngine
             // Only ASCII letters, digits, hyphen, and apostrophe continue runs.
             if (!IsWordCodepoint(cp))
             {
+                boundaryCodepoint = cp;  // Tells FlushRun what ended the run (e.g. '.' for initials)
                 FlushRun();
                 // Update preceding codepoint — punctuation affects cap suppression
                 lastPrecedingCodepoint = cp;
@@ -368,6 +441,7 @@ namespace HCPEngine
         }
 
         // Flush final run
+        boundaryCodepoint = 0;
         FlushRun();
 
         // Post-pass: update lastPrecedingCodepoint between runs.

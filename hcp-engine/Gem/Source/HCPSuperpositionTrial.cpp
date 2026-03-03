@@ -317,9 +317,25 @@ namespace HCPEngine
         AZStd::vector<AZ::u32> codepoints = DecodeUtf8ToCodepoints(inputText);
         result.totalBytes = static_cast<AZ::u32>(inputText.size());
 
-        // Truncate at codepoint level
-        if (codepoints.size() > maxChars)
-            codepoints.resize(maxChars);
+        // Truncate at codepoint level, snapping to word boundary (last whitespace)
+        // maxChars == 0 means process entire text (no truncation)
+        if (maxChars > 0 && codepoints.size() > maxChars)
+        {
+            AZ::u32 cutAt = maxChars;
+            // Back up to the last whitespace/punctuation to avoid mid-word chop
+            while (cutAt > 0 && cutAt > maxChars - 40 &&
+                   codepoints[cutAt - 1] != ' ' && codepoints[cutAt - 1] != '\t' &&
+                   codepoints[cutAt - 1] != '\n' && codepoints[cutAt - 1] != '\r' &&
+                   codepoints[cutAt - 1] != '.' && codepoints[cutAt - 1] != ',' &&
+                   codepoints[cutAt - 1] != ';' && codepoints[cutAt - 1] != '!' &&
+                   codepoints[cutAt - 1] != '?')
+            {
+                --cutAt;
+            }
+            if (cutAt == 0 || cutAt <= maxChars - 40)
+                cutAt = maxChars;  // Fallback: no whitespace found within 40 chars
+            codepoints.resize(cutAt);
+        }
 
         const AZ::u32 N = static_cast<AZ::u32>(codepoints.size());
         result.totalCodepoints = N;
@@ -415,7 +431,7 @@ namespace HCPEngine
 
         // ---- Validation: compare against computational tokenizer ----
         AZStd::string text = inputText;
-        if (text.size() > maxChars)
+        if (maxChars > 0 && text.size() > maxChars)
             text = text.substr(0, maxChars);
         TokenStream compStream = Tokenize(text, vocab);
         fprintf(stderr, "\n[SuperpositionTrial] Computational tokenizer: %zu tokens from same input\n",

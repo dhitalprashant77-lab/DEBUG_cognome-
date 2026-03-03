@@ -18,6 +18,10 @@ namespace HCPEngine
         AZStd::vector<AZStd::string> tokenIds;
         AZStd::vector<int> positions;  // 1:1 with tokenIds — position of each token
         int totalSlots = 0;            // Final position counter (for total_slots in DB)
+
+        // Positional modifiers: 1:1 with tokenIds. Zero = bare token (no overhead).
+        // Packed: (morphBits << 2) | capFlags  where capFlags = (firstCap | (allCaps << 1))
+        AZStd::vector<AZ::u32> modifiers;
     };
 
     //! Tokenize text into an ordered token stream.

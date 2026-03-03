@@ -18,6 +18,15 @@ namespace HCPEngine
 {
     class HCPVocabulary;
 
+    //! Transform layer tag — guides resolution routing.
+    //! Detected by punctuation context in the P1→P2 boundary.
+    enum class RunTag : AZ::u8
+    {
+        Word = 0,       // Normal word — resolve via PBD
+        SingleChar,     // Single-char word (I, a) — pre-assigned at transform, skip PBD
+        Numeric,        // All digits (possibly with hyphens) — tag, skip PBD
+    };
+
     //! A character run extracted from the input stream.
     //! Runs are whitespace-delimited, edge-punctuation-stripped, lowercased.
     struct CharRun
@@ -25,6 +34,12 @@ namespace HCPEngine
         AZStd::string text;       // Lowercase core (no edge punct)
         AZ::u32 startPos;         // Position in original input
         AZ::u32 length;           // Character count
+
+        // Transform layer routing tag
+        RunTag tag = RunTag::Word;
+
+        // Pre-assigned token ID (for SingleChar, Numeric — resolved at transform layer)
+        AZStd::string preAssignedTokenId;
 
         // Normalization metadata — capitalization is positional, lowercase is canonical
         bool firstCap = false;                   // First char was uppercase (Label pattern)
@@ -37,6 +52,7 @@ namespace HCPEngine
         //   Unusual ("eBook") → firstCap=false, allCaps=false, capMask={1}
         // Sentence-initial caps (after . ? ! \n or at stream pos 0) are suppressed:
         //   firstCap and allCaps are cleared (positional, not intrinsic)
+        // Exception: I is always capitalized (intrinsic, never suppressed)
     };
 
     //! Result for a single vocabulary word candidate tested against a run.

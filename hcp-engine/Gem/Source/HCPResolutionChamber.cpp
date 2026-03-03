@@ -7,6 +7,9 @@
 #include <cstdio>
 #include <cctype>
 #include <cmath>
+#include <cstring>
+
+#include <libpq-fe.h>
 
 #include <PxPhysicsAPI.h>
 #include <PxParticleGpu.h>
@@ -41,9 +44,6 @@ namespace HCPEngine
     {
         m_buckets.clear();
         m_totalWords = 0;
-
-        const AZ::u32 tierLimits[] = { RC_TIER_0_MAX, RC_TIER_1_MAX, RC_TIER_2_MAX };
-        constexpr AZ::u32 numTierLimits = 3;
 
         vocab.IterateWords([&](const AZStd::string& wordForm,
                                const AZStd::string& tokenId) -> bool
@@ -80,6 +80,7 @@ namespace HCPEngine
             entry.word = lower;
             entry.tokenId = tokenId;
             entry.bondCount = bondCount;
+            entry.freqRank = 0;  // LMDB path has no frequency data
             entry.tierIndex = 0;
 
             bucket.entries.push_back(AZStd::move(entry));
@@ -93,43 +94,10 @@ namespace HCPEngine
 
         for (auto& [key, bucket] : m_buckets)
         {
-            AZStd::sort(bucket.entries.begin(), bucket.entries.end(),
-                [](const TieredVocabEntry& a, const TieredVocabEntry& b)
-                {
-                    return a.bondCount > b.bondCount;
-                });
-
-            AZ::u32 totalCapacity = 0;
-            for (AZ::u32 t = 0; t < numTierLimits; ++t)
-                totalCapacity += tierLimits[t];
-
-            if (bucket.entries.size() > totalCapacity)
-            {
-                excludedWords += bucket.entries.size() - totalCapacity;
-                bucket.entries.resize(totalCapacity);
-            }
-
-            bucket.tierBoundaries.clear();
-            bucket.tierBoundaries.push_back(0);
-
-            AZ::u32 currentTier = 0;
-            AZ::u32 tierStart = 0;
-
-            for (AZ::u32 i = 0; i < static_cast<AZ::u32>(bucket.entries.size()); ++i)
-            {
-                AZ::u32 posInTier = i - tierStart;
-
-                if (currentTier < numTierLimits && posInTier >= tierLimits[currentTier])
-                {
-                    ++currentTier;
-                    tierStart = i;
-                    bucket.tierBoundaries.push_back(i);
-                }
-
-                bucket.entries[i].tierIndex = currentTier;
-            }
-
-            bucket.tierCount = currentTier + 1;
+            size_t beforeSize = bucket.entries.size();
+            AssignTiers(bucket);
+            if (bucket.entries.size() < beforeSize)
+                excludedWords += beforeSize - bucket.entries.size();
             tieredWords += bucket.entries.size();
         }
 
@@ -141,11 +109,284 @@ namespace HCPEngine
         LogStats();
     }
 
+    void TierAssembly::AssignTiers(ChamberVocab& bucket)
+    {
+        const AZ::u32 tierLimits[] = { RC_TIER_0_MAX, RC_TIER_1_MAX, RC_TIER_2_MAX };
+        constexpr AZ::u32 numTierLimits = 3;
+
+        // Sort by frequency rank ascending (most frequent first).
+        // freqRank=0 means unranked — sort last. Fall back to bondCount for unranked entries.
+        AZStd::sort(bucket.entries.begin(), bucket.entries.end(),
+            [](const TieredVocabEntry& a, const TieredVocabEntry& b)
+            {
+                bool aRanked = a.freqRank > 0;
+                bool bRanked = b.freqRank > 0;
+                if (aRanked != bRanked) return aRanked;  // Ranked before unranked
+                if (aRanked && bRanked) return a.freqRank < b.freqRank;  // Lower rank = more frequent
+                return a.bondCount > b.bondCount;  // Unranked: fall back to bond count
+            });
+
+        AZ::u32 totalCapacity = 0;
+        for (AZ::u32 t = 0; t < numTierLimits; ++t)
+            totalCapacity += tierLimits[t];
+
+        if (bucket.entries.size() > totalCapacity)
+        {
+            bucket.entries.resize(totalCapacity);
+        }
+
+        bucket.tierBoundaries.clear();
+        bucket.tierBoundaries.push_back(0);
+
+        AZ::u32 currentTier = 0;
+        AZ::u32 tierStart = 0;
+
+        for (AZ::u32 i = 0; i < static_cast<AZ::u32>(bucket.entries.size()); ++i)
+        {
+            AZ::u32 posInTier = i - tierStart;
+
+            if (currentTier < numTierLimits && posInTier >= tierLimits[currentTier])
+            {
+                ++currentTier;
+                tierStart = i;
+                bucket.tierBoundaries.push_back(i);
+            }
+
+            bucket.entries[i].tierIndex = currentTier;
+        }
+
+        bucket.tierCount = (bucket.entries.empty()) ? 0 : currentTier + 1;
+    }
+
+    void TierAssembly::BuildFromDatabase(PGconn* conn, const HCPBondTable& bondTable)
+    {
+        m_buckets.clear();
+        m_apostropheBuckets.clear();
+        m_hyphenBuckets.clear();
+        m_totalWords = 0;
+
+        auto t0 = std::chrono::high_resolution_clock::now();
+
+        // ---- Normal buckets: query by particle_key = "{firstChar}{len}" ----
+        for (char c = 'a'; c <= 'z'; ++c)
+        {
+            for (AZ::u32 len = 2; len <= 30; ++len)
+            {
+                char keyBuf[8];
+                snprintf(keyBuf, sizeof(keyBuf), "%c%u", c, len);
+                const char* paramValues[1] = { keyBuf };
+                int paramLengths[1] = { static_cast<int>(strlen(keyBuf)) };
+                int paramFormats[1] = { 0 };
+
+                PGresult* res = PQexecParams(conn,
+                    "SELECT name, token_id, freq_rank FROM tokens WHERE ns LIKE 'AB%' AND particle_key = $1",
+                    1, nullptr, paramValues, paramLengths, paramFormats, 0);
+
+                if (PQresultStatus(res) != PGRES_TUPLES_OK)
+                {
+                    PQclear(res);
+                    continue;
+                }
+
+                int nrows = PQntuples(res);
+                if (nrows == 0)
+                {
+                    PQclear(res);
+                    continue;
+                }
+
+                AZ::u32 key = MakeBucketKey(len, c);
+                auto& bucket = m_buckets[key];
+                bucket.bucketKey = key;
+                bucket.wordLength = len;
+                bucket.firstChar = c;
+                bucket.tierCount = 0;
+                bucket.entries.reserve(nrows);
+
+                for (int r = 0; r < nrows; ++r)
+                {
+                    const char* name = PQgetvalue(res, r, 0);
+                    const char* tokenId = PQgetvalue(res, r, 1);
+                    const char* freqRankStr = PQgetvalue(res, r, 2);
+
+                    AZStd::string word(name);
+                    AZ::u32 bondCount = ComputeWordBondCount(word, bondTable);
+                    AZ::u32 freqRank = (freqRankStr && freqRankStr[0]) ? static_cast<AZ::u32>(atoi(freqRankStr)) : 0;
+
+                    TieredVocabEntry entry;
+                    entry.word = AZStd::move(word);
+                    entry.tokenId = AZStd::string(tokenId);
+                    entry.bondCount = bondCount;
+                    entry.freqRank = freqRank;
+                    entry.tierIndex = 0;
+                    bucket.entries.push_back(AZStd::move(entry));
+                }
+
+                PQclear(res);
+            }
+        }
+
+        // Assign tiers to normal buckets
+        size_t tieredWords = 0;
+        size_t excludedWords = 0;
+        for (auto& [key, bucket] : m_buckets)
+        {
+            size_t beforeSize = bucket.entries.size();
+            AssignTiers(bucket);
+            if (bucket.entries.size() < beforeSize)
+                excludedWords += beforeSize - bucket.entries.size();
+            tieredWords += bucket.entries.size();
+        }
+        m_totalWords = tieredWords;
+
+        // ---- Apostrophe buckets: particle_key LIKE '''%' ----
+        {
+            PGresult* res = PQexecParams(conn,
+                "SELECT name, token_id, freq_rank FROM tokens WHERE ns LIKE 'AB%' AND particle_key LIKE '''%'",
+                0, nullptr, nullptr, nullptr, nullptr, 0);
+
+            if (PQresultStatus(res) == PGRES_TUPLES_OK)
+            {
+                int nrows = PQntuples(res);
+                for (int r = 0; r < nrows; ++r)
+                {
+                    const char* name = PQgetvalue(res, r, 0);
+                    const char* tokenId = PQgetvalue(res, r, 1);
+                    const char* freqRankStr = PQgetvalue(res, r, 2);
+                    AZStd::string word(name);
+                    if (word.empty()) continue;
+
+                    char fc = static_cast<char>(std::tolower(static_cast<unsigned char>(word[0])));
+                    AZ::u32 bondCount = ComputeWordBondCount(word, bondTable);
+                    AZ::u32 freqRank = (freqRankStr && freqRankStr[0]) ? static_cast<AZ::u32>(atoi(freqRankStr)) : 0;
+
+                    TieredVocabEntry entry;
+                    entry.word = AZStd::move(word);
+                    entry.tokenId = AZStd::string(tokenId);
+                    entry.bondCount = bondCount;
+                    entry.freqRank = freqRank;
+                    entry.tierIndex = 0;
+                    m_apostropheBuckets[fc].entries.push_back(AZStd::move(entry));
+                }
+                PQclear(res);
+            }
+            else
+            {
+                PQclear(res);
+            }
+
+            size_t apoTotal = 0;
+            for (auto& [fc, bucket] : m_apostropheBuckets)
+            {
+                bucket.firstChar = fc;
+                bucket.wordLength = 0;  // Variable
+                bucket.bucketKey = 0;
+                AssignTiers(bucket);
+                apoTotal += bucket.entries.size();
+            }
+            m_totalWords += apoTotal;
+
+            fprintf(stderr, "[TierAssembly] BuildFromDatabase: %zu apostrophe words in %zu groups\n",
+                apoTotal, m_apostropheBuckets.size());
+            fflush(stderr);
+        }
+
+        // ---- Hyphen buckets: particle_key LIKE '-%' ----
+        {
+            PGresult* res = PQexecParams(conn,
+                "SELECT name, token_id, freq_rank FROM tokens WHERE ns LIKE 'AB%' AND particle_key LIKE '-%'",
+                0, nullptr, nullptr, nullptr, nullptr, 0);
+
+            if (PQresultStatus(res) == PGRES_TUPLES_OK)
+            {
+                int nrows = PQntuples(res);
+                for (int r = 0; r < nrows; ++r)
+                {
+                    const char* name = PQgetvalue(res, r, 0);
+                    const char* tokenId = PQgetvalue(res, r, 1);
+                    const char* freqRankStr = PQgetvalue(res, r, 2);
+                    AZStd::string word(name);
+                    if (word.empty()) continue;
+
+                    char fc = static_cast<char>(std::tolower(static_cast<unsigned char>(word[0])));
+                    AZ::u32 bondCount = ComputeWordBondCount(word, bondTable);
+                    AZ::u32 freqRank = (freqRankStr && freqRankStr[0]) ? static_cast<AZ::u32>(atoi(freqRankStr)) : 0;
+
+                    TieredVocabEntry entry;
+                    entry.word = AZStd::move(word);
+                    entry.tokenId = AZStd::string(tokenId);
+                    entry.bondCount = bondCount;
+                    entry.freqRank = freqRank;
+                    entry.tierIndex = 0;
+                    m_hyphenBuckets[fc].entries.push_back(AZStd::move(entry));
+                }
+                PQclear(res);
+            }
+            else
+            {
+                PQclear(res);
+            }
+
+            size_t hypTotal = 0;
+            for (auto& [fc, bucket] : m_hyphenBuckets)
+            {
+                bucket.firstChar = fc;
+                bucket.wordLength = 0;  // Variable
+                bucket.bucketKey = 0;
+                AssignTiers(bucket);
+                hypTotal += bucket.entries.size();
+            }
+            m_totalWords += hypTotal;
+
+            fprintf(stderr, "[TierAssembly] BuildFromDatabase: %zu hyphen words in %zu groups\n",
+                hypTotal, m_hyphenBuckets.size());
+            fflush(stderr);
+        }
+
+        auto t1 = std::chrono::high_resolution_clock::now();
+        float ms = static_cast<float>(std::chrono::duration<double, std::milli>(t1 - t0).count());
+
+        fprintf(stderr, "[TierAssembly] BuildFromDatabase: %zu buckets, %zu tiered words, "
+            "%zu excluded (var fallback), %.1f ms\n",
+            m_buckets.size(), tieredWords, excludedWords, ms);
+        fflush(stderr);
+
+        LogStats();
+    }
+
     const ChamberVocab* TierAssembly::GetBucket(AZ::u32 wordLength, char firstChar) const
     {
         auto it = m_buckets.find(MakeBucketKey(wordLength, firstChar));
         if (it == m_buckets.end()) return nullptr;
         return &it->second;
+    }
+
+    AZStd::vector<const ChamberVocab*> TierAssembly::GetBucketsForLength(AZ::u32 wordLength) const
+    {
+        AZStd::vector<const ChamberVocab*> result;
+        for (char c = 'a'; c <= 'z'; ++c)
+        {
+            auto it = m_buckets.find(MakeBucketKey(wordLength, c));
+            if (it != m_buckets.end() && !it->second.entries.empty())
+                result.push_back(&it->second);
+        }
+        return result;
+    }
+
+    AZStd::vector<AZ::u32> TierAssembly::GetActiveWordLengths() const
+    {
+        AZStd::unordered_map<AZ::u32, bool> lengths;
+        for (const auto& [key, bucket] : m_buckets)
+        {
+            if (!bucket.entries.empty())
+                lengths[bucket.wordLength] = true;
+        }
+        AZStd::vector<AZ::u32> result;
+        result.reserve(lengths.size());
+        for (const auto& [len, _] : lengths)
+            result.push_back(len);
+        AZStd::sort(result.begin(), result.end(), AZStd::greater<AZ::u32>());
+        return result;
     }
 
     void TierAssembly::LogStats() const
