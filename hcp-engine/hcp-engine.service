@@ -1,0 +1,20 @@
+[Unit]
+Description=HCP Engine Daemon (PhysX PBD resolver)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=patrick
+WorkingDirectory=/opt/project/repo/hcp-engine/build/linux/bin/profile
+Environment=LD_LIBRARY_PATH=/opt/project/repo/hcp-engine/build/linux/bin/profile:/opt/project/repo/hcp-engine/build/linux/lib/profile
+ExecStart=/opt/project/repo/hcp-engine/build/linux/bin/profile/HCPEngine.GameLauncher --rhi=null --headless --bg-mode
+Restart=always
+RestartSec=2
+
+# The O3DE game loop exits after Activate() in headless mode (no level to tick).
+# Restart=always keeps the daemon cycling. Each restart re-inits in ~6s (LMDB cached).
+# Proper fix: block main thread on socket server join in daemon mode.
+
+[Install]
+WantedBy=multi-user.target

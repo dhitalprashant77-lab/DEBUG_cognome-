@@ -1,5 +1,7 @@
 #pragma once
 
+#include <AzCore/std/string/string.h>
+
 #if !defined(Q_MOC_RUN)
 #include <QMainWindow>
 #include <QTabWidget>
@@ -16,19 +18,27 @@
 
 namespace HCPEngine
 {
-    class HCPEngineSystemComponent;
+    class HCPSocketClient;
+    class HCPWorkstationEngine;
+    class HCPVocabulary;
 
     /// Main window for the HCP Source Workstation.
     /// Crystal Reports-style data surfing tool — document navigator (left),
     /// tabbed data panels (right), status bar (bottom).
     ///
-    /// Engine pointer injected at construction — no singleton access.
+    /// Dual-mode operation:
+    ///   - Embedded kernels (WorkstationEngine): direct DB access for browsing,
+    ///     metadata editing, bond/var/entity queries, text reconstruction.
+    ///     Works offline without a running daemon.
+    ///   - Socket client (HCPSocketClient): physics operations (phys_resolve,
+    ///     tokenize, ingest with PBD pipeline). Requires running daemon.
     class HCPWorkstationWindow : public QMainWindow
     {
         Q_OBJECT
 
     public:
-        explicit HCPWorkstationWindow(HCPEngineSystemComponent* engine,
+        explicit HCPWorkstationWindow(HCPWorkstationEngine* engine,
+                                       HCPSocketClient* client,
                                        QWidget* parent = nullptr);
         ~HCPWorkstationWindow() override;
 
@@ -50,6 +60,11 @@ namespace HCPEngine
         void OnVarClicked(QTreeWidgetItem* item, int column);
         void OnEntityClicked(QTreeWidgetItem* item, int column);
         void OnBreadcrumbReset();
+
+        // Connection state
+        void OnEngineConnected();
+        void OnEngineDisconnected();
+        void OnEngineConnectionFailed(const QString& reason);
 
     private:
         void BuildMenuBar();
@@ -78,9 +93,15 @@ namespace HCPEngine
                                      const QString& metadataJson = {});
 
         void UpdateStatusBar();
+        void SetControlsEnabled(bool enabled);
 
-        // Engine — injected, not owned
-        HCPEngineSystemComponent* m_engine = nullptr;
+        /// Resolve a token ID to its surface form for display.
+        /// Handles words, chars (with control notation), and structural markers.
+        QString ResolveSurface(const AZStd::string& tokenId);
+
+        // Data sources — injected, not owned
+        HCPWorkstationEngine* m_engine = nullptr;  // Direct DB + LMDB (offline-capable)
+        HCPSocketClient* m_client = nullptr;        // Daemon socket (physics ops)
 
         // Left panel — document navigator
         QTreeWidget* m_docList = nullptr;
@@ -124,23 +145,21 @@ namespace HCPEngine
         QPushButton* m_breadcrumbReset = nullptr;
 
         // Status bar widgets
-        QLabel* m_statusEngine = nullptr;
-        QLabel* m_statusDb = nullptr;
-        QLabel* m_statusGpu = nullptr;
+        QLabel* m_statusDb = nullptr;       // "DB: Connected/Disconnected"
+        QLabel* m_statusEngine = nullptr;   // "Engine: Ready/Offline"
+        QLabel* m_statusCounts = nullptr;
         QProgressBar* m_progressBar = nullptr;
+
+        // Cached doc PK for entity/bond queries (avoids re-lookup)
+        int m_selectedDocPk = 0;
 
         // State
         QString m_selectedDocId;
-        int m_selectedDocPk = 0;
         QString m_activeFilter;
 
         // Tab indices
-        int m_tabInfo = 0;
-        int m_tabMeta = 1;
         int m_tabEntities = 2;
         int m_tabVars = 3;
-        int m_tabBonds = 4;
-        int m_tabText = 5;
     };
 
 } // namespace HCPEngine

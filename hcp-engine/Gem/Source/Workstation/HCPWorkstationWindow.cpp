@@ -1,10 +1,14 @@
+/// HCP Source Workstation — Dual-mode main window implementation.
+///
+/// Data browsing (list, info, metadata, bonds, vars, entities, text) uses
+/// embedded kernels via HCPWorkstationEngine for direct DB + LMDB access.
+/// Physics operations (ingest, tokenize, phys_resolve) use the socket client
+/// to communicate with the engine daemon.
+
 #include "HCPWorkstationWindow.h"
-#include "../HCPEngineSystemComponent.h"
-#include <HCPEngine/HCPEngineBus.h>
-#include "../HCPStorage.h"
-#include "../HCPVocabulary.h"
+#include "HCPWorkstationEngine.h"
+#include "HCPSocketClient.h"
 #include "../HCPTokenizer.h"
-#include "../HCPCacheMissResolver.h"
 
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -40,16 +44,37 @@
 #include <QFile>
 #include <QMessageBox>
 
-namespace
+#include <AzCore/std/containers/unordered_map.h>
+
+namespace HCPEngine
 {
-    // Resolve a token ID to a human-readable surface form for UI display.
-    // Shared utility — same logic as the editor panel version.
-    QString ResolveSurface(const AZStd::string& tokenId, const HCPEngine::HCPVocabulary& vocab)
+    // ---- Surface resolution helper (same logic as editor widget) ----
+
+    static const AZStd::unordered_map<AZStd::string, const char*> s_structuralMarkers = {
+        {"AA.AE.AA.AA", "document_start"}, {"AA.AE.AA.AB", "document_end"},
+        {"AA.AE.AA.AC", "part_break"}, {"AA.AE.AA.AD", "chapter_break"},
+        {"AA.AE.AA.AE", "section_break"}, {"AA.AE.AA.AF", "subsection_break"},
+        {"AA.AE.AA.AG", "subsubsection_break"}, {"AA.AE.AA.AH", "minor_break"},
+        {"AA.AE.AB.AA", "paragraph_start"}, {"AA.AE.AB.AB", "paragraph_end"},
+        {"AA.AE.AB.AC", "sentence_start"}, {"AA.AE.AB.AD", "sentence_end"},
+        {"AA.AE.AB.AE", "line_start"}, {"AA.AE.AB.AF", "line_end"},
+        {"AA.AE.AF.AA.AA", "stream_start"}, {"AA.AE.AF.AA.AB", "stream_end"},
+        {"AA.AE.AF.AA.AC", "var_request"},
+    };
+
+    QString HCPWorkstationWindow::ResolveSurface(const AZStd::string& tokenId)
     {
+        if (!m_engine || !m_engine->IsVocabLoaded())
+            return {};
+
+        const auto& vocab = m_engine->GetVocabulary();
+
+        // Word tokens (most common)
         AZStd::string word = vocab.TokenToWord(tokenId);
         if (!word.empty())
             return QString::fromUtf8(word.c_str(), static_cast<int>(word.size()));
 
+        // Single-character tokens
         char c = vocab.TokenToChar(tokenId);
         if (c != '\0')
         {
@@ -63,35 +88,21 @@ namespace
             }
         }
 
-        if (tokenId.starts_with("AA.AE."))
-        {
-            static const AZStd::unordered_map<AZStd::string, const char*> markers = {
-                {"AA.AE.AA.AA", "document_start"}, {"AA.AE.AA.AB", "document_end"},
-                {"AA.AE.AA.AC", "part_break"}, {"AA.AE.AA.AD", "chapter_break"},
-                {"AA.AE.AA.AE", "section_break"}, {"AA.AE.AA.AF", "subsection_break"},
-                {"AA.AE.AA.AG", "subsubsection_break"}, {"AA.AE.AA.AH", "minor_break"},
-                {"AA.AE.AA.AI", "paragraph_start"}, {"AA.AE.AA.AJ", "paragraph_end"},
-                {"AA.AE.AA.AK", "line_break"}, {"AA.AE.AA.AL", "page_break"},
-                {"AA.AE.AA.AM", "horizontal_rule"},
-                {"AA.AE.AA.AN", "block_quote_start"}, {"AA.AE.AA.AP", "block_quote_end"},
-            };
-            auto it = markers.find(tokenId);
-            if (it != markers.end())
-                return QString("[%1]").arg(it->second);
-            return QString("[marker:%1]").arg(
-                QString::fromUtf8(tokenId.c_str(), static_cast<int>(tokenId.size())));
-        }
+        // Structural markers
+        auto it = s_structuralMarkers.find(tokenId);
+        if (it != s_structuralMarkers.end())
+            return QString("[%1]").arg(it->second);
 
         return {};
     }
-} // anonymous namespace
 
-namespace HCPEngine
-{
+    // ---- Constructor / destructor ----
+
     HCPWorkstationWindow::HCPWorkstationWindow(
-        HCPEngineSystemComponent* engine, QWidget* parent)
+        HCPWorkstationEngine* engine, HCPSocketClient* client, QWidget* parent)
         : QMainWindow(parent)
         , m_engine(engine)
+        , m_client(client)
     {
         setWindowTitle("HCP Source Workstation");
         setMinimumSize(1200, 800);
@@ -100,11 +111,69 @@ namespace HCPEngine
         BuildMenuBar();
         BuildStatusBar();
         BuildCentralWidget();
-        PopulateDocumentList();
+
+        // Wire up daemon connection signals (if client provided)
+        if (m_client)
+        {
+            connect(m_client, &HCPSocketClient::connected,
+                this, &HCPWorkstationWindow::OnEngineConnected);
+            connect(m_client, &HCPSocketClient::disconnected,
+                this, &HCPWorkstationWindow::OnEngineDisconnected);
+            connect(m_client, &HCPSocketClient::connectionFailed,
+                this, &HCPWorkstationWindow::OnEngineConnectionFailed);
+        }
+
+        // If we have a working engine, enable controls immediately
+        if (m_engine && m_engine->IsDbConnected())
+        {
+            SetControlsEnabled(true);
+            PopulateDocumentList();
+        }
+        else
+        {
+            SetControlsEnabled(false);
+        }
+
         UpdateStatusBar();
     }
 
     HCPWorkstationWindow::~HCPWorkstationWindow() = default;
+
+    // ---- Connection state (daemon socket) ----
+
+    void HCPWorkstationWindow::OnEngineConnected()
+    {
+        // Daemon connected — update status, refresh if we didn't have DB
+        UpdateStatusBar();
+        if (!m_engine || !m_engine->IsDbConnected())
+        {
+            SetControlsEnabled(true);
+            PopulateDocumentList();
+        }
+    }
+
+    void HCPWorkstationWindow::OnEngineDisconnected()
+    {
+        UpdateStatusBar();
+        // Controls stay enabled if we have direct DB access
+        if (!m_engine || !m_engine->IsDbConnected())
+        {
+            SetControlsEnabled(false);
+        }
+    }
+
+    void HCPWorkstationWindow::OnEngineConnectionFailed(const QString& reason)
+    {
+        m_statusEngine->setText(QString("Engine: %1").arg(reason));
+        m_statusEngine->setStyleSheet("color: red;");
+    }
+
+    void HCPWorkstationWindow::SetControlsEnabled(bool enabled)
+    {
+        m_docList->setEnabled(enabled);
+        m_tabs->setEnabled(enabled);
+        menuBar()->setEnabled(enabled);
+    }
 
     // ---- Menu bar ----
 
@@ -132,7 +201,6 @@ namespace HCPEngine
         connect(quitAction, &QAction::triggered, this, &QMainWindow::close);
 
         auto* viewMenu = menuBar()->addMenu("&View");
-        // Tab visibility toggles will go here once data surfing is implemented
         Q_UNUSED(viewMenu);
     }
 
@@ -140,61 +208,68 @@ namespace HCPEngine
 
     void HCPWorkstationWindow::BuildStatusBar()
     {
-        m_statusEngine = new QLabel("Engine: --");
         m_statusDb = new QLabel("DB: --");
-        m_statusGpu = new QLabel("GPU: --");
+        m_statusEngine = new QLabel("Engine: --");
+        m_statusCounts = new QLabel("");
         m_progressBar = new QProgressBar();
         m_progressBar->setMaximumWidth(200);
         m_progressBar->setVisible(false);
 
-        statusBar()->addWidget(m_statusEngine);
         statusBar()->addWidget(m_statusDb);
-        statusBar()->addWidget(m_statusGpu);
+        statusBar()->addWidget(m_statusEngine);
+        statusBar()->addWidget(m_statusCounts);
         statusBar()->addPermanentWidget(m_progressBar);
     }
 
     void HCPWorkstationWindow::UpdateStatusBar()
     {
-        if (m_engine && m_engine->IsEngineReady())
+        // DB status (embedded kernels)
+        if (m_engine && m_engine->IsDbConnected())
         {
-            m_statusEngine->setText("Engine: Ready");
+            m_statusDb->setText("DB: Connected");
+            m_statusDb->setStyleSheet("color: green;");
+        }
+        else
+        {
+            m_statusDb->setText("DB: Disconnected");
+            m_statusDb->setStyleSheet("color: red;");
+        }
+
+        // Engine daemon status
+        if (m_client && m_client->IsConnected())
+        {
+            m_statusEngine->setText("Engine: Connected");
             m_statusEngine->setStyleSheet("color: green;");
+
+            // Fetch vocab counts from daemon
+            m_client->Health([this](const QJsonObject& resp) {
+                if (resp["status"].toString() != "ok") return;
+
+                qint64 words = static_cast<qint64>(resp["words"].toDouble());
+                qint64 labels = static_cast<qint64>(resp["labels"].toDouble());
+                qint64 chars = static_cast<qint64>(resp["chars"].toDouble());
+                m_statusCounts->setText(
+                    QString("Words: %1 | Labels: %2 | Chars: %3")
+                        .arg(words).arg(labels).arg(chars));
+            });
         }
         else
         {
-            m_statusEngine->setText("Engine: Not Ready");
-            m_statusEngine->setStyleSheet("color: red;");
-        }
+            m_statusEngine->setText("Engine: Offline");
+            m_statusEngine->setStyleSheet("color: gray;");
 
-        if (m_engine)
-        {
-            auto& wk = m_engine->GetWriteKernel();
-            if (wk.IsConnected())
+            // Show local vocab counts if available
+            if (m_engine && m_engine->IsVocabLoaded())
             {
-                m_statusDb->setText("DB: Connected");
-                m_statusDb->setStyleSheet("color: green;");
+                const auto& vocab = m_engine->GetVocabulary();
+                m_statusCounts->setText(
+                    QString("Words: %1 | Labels: %2 | Chars: %3 (local)")
+                        .arg(vocab.WordCount()).arg(vocab.LabelCount()).arg(vocab.CharCount()));
             }
-            else
-            {
-                m_statusDb->setText("DB: Disconnected");
-                m_statusDb->setStyleSheet("color: orange;");
-            }
-        }
-
-        // GPU mode — check if particle pipeline has CUDA
-        if (m_engine && m_engine->GetParticlePipeline().IsInitialized())
-        {
-            m_statusGpu->setText("GPU: Active");
-            m_statusGpu->setStyleSheet("color: green;");
-        }
-        else
-        {
-            m_statusGpu->setText("GPU: CPU Mode");
-            m_statusGpu->setStyleSheet("color: gray;");
         }
     }
 
-    // ---- Central widget ----
+    // ---- Central widget (unchanged layout) ----
 
     void HCPWorkstationWindow::BuildCentralWidget()
     {
@@ -421,26 +496,47 @@ namespace HCPEngine
         layout->addWidget(m_textView, 1);
     }
 
-    // ---- Document list ----
+    // ========================================================================
+    // Data display methods — use embedded kernels when DB is connected
+    // ========================================================================
 
     void HCPWorkstationWindow::PopulateDocumentList()
     {
         m_docList->clear();
-        if (!m_engine) return;
 
-        auto& wk = m_engine->GetWriteKernel();
-        if (!wk.IsConnected()) wk.Connect();
-        if (!wk.IsConnected()) return;
-
-        auto docs = wk.ListDocuments();
-        for (const auto& d : docs)
+        // Prefer direct DB access
+        if (m_engine && m_engine->IsDbConnected())
         {
-            auto* item = new QTreeWidgetItem(m_docList);
-            item->setText(0, QString::fromUtf8(d.name.c_str(), static_cast<int>(d.name.size())));
-            item->setText(1, QString::number(d.starters));
-            item->setText(2, QString::number(d.bonds));
-            item->setData(0, Qt::UserRole,
-                QString::fromUtf8(d.docId.c_str(), static_cast<int>(d.docId.size())));
+            auto docs = m_engine->GetDocumentQuery().ListDocuments();
+            for (const auto& d : docs)
+            {
+                auto* item = new QTreeWidgetItem(m_docList);
+                item->setText(0, QString::fromUtf8(d.name.c_str(), static_cast<int>(d.name.size())));
+                item->setText(1, QString::number(d.starters));
+                item->setText(2, QString::number(d.bonds));
+                item->setData(0, Qt::UserRole,
+                    QString::fromUtf8(d.docId.c_str(), static_cast<int>(d.docId.size())));
+            }
+            return;
+        }
+
+        // Fallback to socket
+        if (m_client && m_client->IsConnected())
+        {
+            m_client->ListDocuments([this](const QJsonObject& resp) {
+                if (resp["status"].toString() != "ok") return;
+                m_docList->clear();
+                QJsonArray docs = resp["documents"].toArray();
+                for (int i = 0; i < docs.size(); ++i)
+                {
+                    QJsonObject d = docs[i].toObject();
+                    auto* item = new QTreeWidgetItem(m_docList);
+                    item->setText(0, d["name"].toString());
+                    item->setText(1, QString::number(d["starters"].toInt()));
+                    item->setText(2, QString::number(d["bonds"].toInt()));
+                    item->setData(0, Qt::UserRole, d["doc_id"].toString());
+                }
+            });
         }
     }
 
@@ -454,180 +550,181 @@ namespace HCPEngine
     {
         if (!item) return;
         m_selectedDocId = item->data(0, Qt::UserRole).toString();
+        m_selectedDocPk = 0;
         m_activeFilter.clear();
         m_breadcrumb->clear();
         m_breadcrumbReset->setVisible(false);
+
         ShowDocumentInfo(m_selectedDocId);
         ShowEntities(m_selectedDocId);
         ShowVars(m_selectedDocId);
         ShowBonds(m_selectedDocId);
     }
 
-    // ---- Panel data display ----
-
     void HCPWorkstationWindow::ShowDocumentInfo(const QString& docId)
     {
-        if (!m_engine) return;
+        AZStd::string azDocId(docId.toUtf8().constData(), docId.toUtf8().size());
 
-        auto& wk = m_engine->GetWriteKernel();
-        AZStd::string azDocId(docId.toUtf8().constData());
-
-        auto detail = wk.GetDocumentDetail(azDocId);
-        if (detail.pk == 0) return;
-
-        m_selectedDocPk = detail.pk;
-
-        m_infoDocId->setText(docId);
-        m_infoName->setText(QString::fromUtf8(detail.name.c_str(), static_cast<int>(detail.name.size())));
-        m_infoSlots->setText(QString::number(detail.totalSlots));
-        m_infoUnique->setText(QString::number(detail.uniqueTokens));
-        m_infoStarters->setText(QString::number(detail.starters));
-        m_infoBonds->setText(QString::number(detail.bonds));
-
-        // Metadata table
-        m_metaTable->setRowCount(0);
-        if (!detail.metadataJson.empty() && detail.metadataJson != "{}")
+        // Direct DB path
+        if (m_engine && m_engine->IsDbConnected())
         {
-            QByteArray jsonBytes(detail.metadataJson.c_str(),
-                                 static_cast<int>(detail.metadataJson.size()));
-            QJsonDocument jdoc = QJsonDocument::fromJson(jsonBytes);
-            if (jdoc.isObject())
-            {
-                QJsonObject obj = jdoc.object();
-                m_metaTable->setRowCount(obj.size());
-                int row = 0;
-                for (auto it = obj.begin(); it != obj.end(); ++it, ++row)
-                {
-                    m_metaTable->setItem(row, 0, new QTableWidgetItem(it.key()));
-                    QString valStr;
-                    if (it.value().isString())
-                        valStr = it.value().toString();
-                    else
-                        valStr = QString::fromUtf8(
-                            QJsonDocument(QJsonArray({it.value()})).toJson(QJsonDocument::Compact));
-                    m_metaTable->setItem(row, 1, new QTableWidgetItem(valStr));
-                }
-            }
-        }
-    }
+            auto detail = m_engine->GetDocumentQuery().GetDocumentDetail(azDocId);
+            m_selectedDocPk = detail.pk;
 
-    void HCPWorkstationWindow::ShowEntities(const QString& docId, const QString& filterEntityId)
-    {
-        m_entityTree->clear();
-        if (!m_engine) return;
+            m_infoDocId->setText(QString::fromUtf8(detail.docId.c_str(), static_cast<int>(detail.docId.size())));
+            m_infoName->setText(QString::fromUtf8(detail.name.c_str(), static_cast<int>(detail.name.size())));
+            m_infoSlots->setText(QString::number(detail.totalSlots));
+            m_infoUnique->setText(QString::number(detail.uniqueTokens));
+            m_infoStarters->setText(QString::number(detail.starters));
+            m_infoBonds->setText(QString::number(detail.bonds));
 
-        auto& wk = m_engine->GetWriteKernel();
-        AZStd::string azDocId(docId.toUtf8().constData());
-        int docPk = wk.GetDocPk(azDocId);
-        if (docPk == 0) return;
-
-        // Fiction characters
-        PGconn* ficConn = m_engine->GetResolver().GetConnection("hcp_fic_entities");
-        PGconn* pbmConn = wk.GetConnection();
-        if (ficConn && pbmConn)
-        {
-            auto ficEntities = GetFictionEntitiesForDocument(ficConn, pbmConn, docPk);
-            if (!ficEntities.empty())
-            {
-                auto* ficGroup = new QTreeWidgetItem(m_entityTree);
-                ficGroup->setText(0, QString("Fiction Characters (%1)").arg(ficEntities.size()));
-                ficGroup->setExpanded(true);
-                QFont boldFont = ficGroup->font(0);
-                boldFont.setBold(true);
-                ficGroup->setFont(0, boldFont);
-
-                for (const auto& ent : ficEntities)
-                {
-                    QString entId = QString::fromUtf8(ent.entityId.c_str(),
-                        static_cast<int>(ent.entityId.size()));
-                    if (!filterEntityId.isEmpty() && entId != filterEntityId)
-                        continue;
-
-                    auto* item = new QTreeWidgetItem(ficGroup);
-                    item->setText(0, QString::fromUtf8(ent.name.c_str(),
-                        static_cast<int>(ent.name.size())));
-                    item->setText(1, entId);
-                    item->setText(2, QString::fromUtf8(ent.category.c_str(),
-                        static_cast<int>(ent.category.size())));
-
-                    QString propStr;
-                    for (const auto& [k, v] : ent.properties)
-                    {
-                        if (!propStr.isEmpty()) propStr += ", ";
-                        propStr += QString::fromUtf8(k.c_str(), static_cast<int>(k.size()))
-                            + "=" + QString::fromUtf8(v.c_str(), static_cast<int>(v.size()));
-                    }
-                    item->setText(3, propStr);
-                }
-            }
-        }
-
-        // Non-fiction author
-        PGconn* nfConn = m_engine->GetResolver().GetConnection("hcp_nf_entities");
-        if (nfConn)
-        {
-            auto detail = wk.GetDocumentDetail(azDocId);
-            AZStd::string authorSearch;
-
-            if (!detail.metadataJson.empty() && detail.metadataJson != "{}")
+            // Metadata table
+            m_metaTable->setRowCount(0);
+            if (!detail.metadataJson.empty())
             {
                 QByteArray jsonBytes(detail.metadataJson.c_str(),
-                                     static_cast<int>(detail.metadataJson.size()));
+                    static_cast<int>(detail.metadataJson.size()));
                 QJsonDocument jdoc = QJsonDocument::fromJson(jsonBytes);
                 if (jdoc.isObject())
                 {
-                    QJsonObject obj = jdoc.object();
-                    if (obj.contains("authors") && obj["authors"].isArray())
+                    QJsonObject meta = jdoc.object();
+                    m_metaTable->setRowCount(meta.size());
+                    int row = 0;
+                    for (auto it = meta.begin(); it != meta.end(); ++it, ++row)
                     {
-                        QJsonArray authors = obj["authors"].toArray();
-                        if (!authors.isEmpty())
-                        {
-                            QString name = authors[0].toObject()["name"].toString();
-                            if (name.contains(','))
-                                name = name.split(',').first().trimmed();
-                            authorSearch = AZStd::string(name.toUtf8().constData());
-                        }
-                    }
-                    else if (obj.contains("author") && obj["author"].isString())
-                    {
-                        QString name = obj["author"].toString();
-                        if (name.contains(','))
-                            name = name.split(',').first().trimmed();
-                        authorSearch = AZStd::string(name.toUtf8().constData());
+                        m_metaTable->setItem(row, 0, new QTableWidgetItem(it.key()));
+                        QString valStr;
+                        if (it.value().isString())
+                            valStr = it.value().toString();
+                        else
+                            valStr = QString::fromUtf8(
+                                QJsonDocument(QJsonArray({it.value()})).toJson(QJsonDocument::Compact));
+                        m_metaTable->setItem(row, 1, new QTableWidgetItem(valStr));
                     }
                 }
             }
+            return;
+        }
 
-            if (!authorSearch.empty())
-            {
-                auto author = GetNfAuthorEntity(nfConn, authorSearch);
-                if (!author.entityId.empty())
+        // Socket fallback
+        if (m_client && m_client->IsConnected())
+        {
+            m_client->GetDocumentInfo(docId, [this](const QJsonObject& resp) {
+                if (resp["status"].toString() != "ok") return;
+
+                m_infoDocId->setText(resp["doc_id"].toString());
+                m_infoName->setText(resp["name"].toString());
+                m_infoSlots->setText(QString::number(resp["total_slots"].toInt()));
+                m_infoUnique->setText(QString::number(resp["unique"].toInt()));
+                m_infoStarters->setText(QString::number(resp["starters"].toInt()));
+                m_infoBonds->setText(QString::number(resp["bonds"].toInt()));
+
+                m_metaTable->setRowCount(0);
+                if (resp.contains("metadata") && resp["metadata"].isObject())
                 {
-                    auto* nfGroup = new QTreeWidgetItem(m_entityTree);
-                    nfGroup->setText(0, "Author / People");
-                    nfGroup->setExpanded(true);
-                    QFont boldFont = nfGroup->font(0);
-                    boldFont.setBold(true);
-                    nfGroup->setFont(0, boldFont);
-
-                    auto* item = new QTreeWidgetItem(nfGroup);
-                    QString displayName = QString::fromUtf8(
-                        author.name.c_str(), static_cast<int>(author.name.size()));
-                    displayName.replace('_', ' ');
-                    item->setText(0, displayName);
-                    item->setText(1, QString::fromUtf8(
-                        author.entityId.c_str(), static_cast<int>(author.entityId.size())));
-                    item->setText(2, QString::fromUtf8(
-                        author.category.c_str(), static_cast<int>(author.category.size())));
-
-                    QString propStr;
-                    for (const auto& [k, v] : author.properties)
+                    QJsonObject meta = resp["metadata"].toObject();
+                    m_metaTable->setRowCount(meta.size());
+                    int row = 0;
+                    for (auto it = meta.begin(); it != meta.end(); ++it, ++row)
                     {
-                        if (!propStr.isEmpty()) propStr += ", ";
-                        propStr += QString::fromUtf8(k.c_str(), static_cast<int>(k.size()))
-                            + "=" + QString::fromUtf8(v.c_str(), static_cast<int>(v.size()));
+                        m_metaTable->setItem(row, 0, new QTableWidgetItem(it.key()));
+                        QString valStr;
+                        if (it.value().isString())
+                            valStr = it.value().toString();
+                        else
+                            valStr = QString::fromUtf8(
+                                QJsonDocument(QJsonArray({it.value()})).toJson(QJsonDocument::Compact));
+                        m_metaTable->setItem(row, 1, new QTableWidgetItem(valStr));
                     }
-                    item->setText(3, propStr);
+                }
+            });
+        }
+    }
+
+    void HCPWorkstationWindow::ShowEntities(
+        const QString& docId, const QString& filterEntityId)
+    {
+        m_entityTree->clear();
+
+        if (!m_engine || !m_engine->IsDbConnected() || m_selectedDocPk == 0)
+            return;
+
+        // Fiction entities — direct DB cross-reference
+        auto ficEntities = m_engine->GetFictionEntities(m_selectedDocPk);
+        if (!ficEntities.empty())
+        {
+            auto* ficRoot = new QTreeWidgetItem(m_entityTree);
+            ficRoot->setText(0, "Fiction Characters");
+            ficRoot->setExpanded(true);
+
+            for (const auto& ent : ficEntities)
+            {
+                QString entId = QString::fromUtf8(ent.entityId.c_str(), static_cast<int>(ent.entityId.size()));
+
+                // Apply filter if active
+                if (!filterEntityId.isEmpty() && entId != filterEntityId)
+                    continue;
+
+                auto* item = new QTreeWidgetItem(ficRoot);
+                item->setText(0, QString::fromUtf8(ent.name.c_str(), static_cast<int>(ent.name.size())));
+                item->setText(1, entId);
+                item->setText(2, QString::fromUtf8(ent.category.c_str(), static_cast<int>(ent.category.size())));
+
+                // Properties as comma-separated string
+                QStringList props;
+                for (const auto& [k, v] : ent.properties)
+                {
+                    props.append(QString("%1=%2")
+                        .arg(QString::fromUtf8(k.c_str(), static_cast<int>(k.size())))
+                        .arg(QString::fromUtf8(v.c_str(), static_cast<int>(v.size()))));
+                }
+                item->setText(3, props.join(", "));
+            }
+        }
+
+        // Author entity — lookup from document metadata
+        if (m_engine->HasEntityConnections() && !m_engine->GetVocabulary().IsLoaded())
+        {
+            // Skip author lookup if we can't resolve metadata
+        }
+        else if (m_engine->HasEntityConnections())
+        {
+            // Try to get author from metadata for NF entity lookup
+            auto detail = m_engine->GetDocumentQuery().GetDocumentDetail(
+                AZStd::string(docId.toUtf8().constData(), docId.toUtf8().size()));
+            if (!detail.metadataJson.empty())
+            {
+                QJsonDocument jdoc = QJsonDocument::fromJson(
+                    QByteArray(detail.metadataJson.c_str(), static_cast<int>(detail.metadataJson.size())));
+                if (jdoc.isObject())
+                {
+                    QJsonObject meta = jdoc.object();
+                    QString authorName;
+                    if (meta.contains("authors"))
+                    {
+                        QJsonValue authVal = meta["authors"];
+                        if (authVal.isString())
+                            authorName = authVal.toString();
+                        else if (authVal.isArray() && authVal.toArray().size() > 0)
+                            authorName = authVal.toArray()[0].toString();
+                    }
+
+                    if (!authorName.isEmpty())
+                    {
+                        AZStd::string azAuthor(authorName.toUtf8().constData(), authorName.toUtf8().size());
+                        auto nfEnt = m_engine->GetNfAuthor(azAuthor);
+                        if (!nfEnt.entityId.empty())
+                        {
+                            auto* authRoot = new QTreeWidgetItem(m_entityTree);
+                            authRoot->setText(0, "Authors / People");
+                            authRoot->setExpanded(true);
+
+                            auto* item = new QTreeWidgetItem(authRoot);
+                            item->setText(0, QString::fromUtf8(nfEnt.name.c_str(), static_cast<int>(nfEnt.name.size())));
+                            item->setText(1, QString::fromUtf8(nfEnt.entityId.c_str(), static_cast<int>(nfEnt.entityId.size())));
+                            item->setText(2, QString::fromUtf8(nfEnt.category.c_str(), static_cast<int>(nfEnt.category.size())));
+                        }
+                    }
                 }
             }
         }
@@ -635,123 +732,193 @@ namespace HCPEngine
 
     void HCPWorkstationWindow::ShowBonds(const QString& docId, const QString& tokenId)
     {
-        if (!m_engine) return;
-
-        auto& wk = m_engine->GetWriteKernel();
-        AZStd::string azDocId(docId.toUtf8().constData());
-        AZStd::string azTokenId(tokenId.toUtf8().constData());
-
-        int docPk = wk.GetDocPk(azDocId);
-        if (docPk == 0) return;
-
-        auto bonds = wk.GetBondsForToken(docPk, azTokenId);
         m_bondTree->clear();
 
-        if (tokenId.isEmpty())
+        AZStd::string azDocId(docId.toUtf8().constData(), docId.toUtf8().size());
+        AZStd::string azTokenId(tokenId.toUtf8().constData(), tokenId.toUtf8().size());
+
+        // Direct DB path
+        if (m_engine && m_engine->IsDbConnected() && m_selectedDocPk > 0)
         {
-            m_bondHeader->setText(QString("Top starters (%1 shown)").arg(bonds.size()));
+            auto bonds = m_engine->GetBondQuery().GetBondsForToken(m_selectedDocPk, azTokenId);
+
+            if (tokenId.isEmpty())
+            {
+                m_bondHeader->setText(QString("Top starters (%1 shown)").arg(bonds.size()));
+            }
+            else
+            {
+                QString surface = ResolveSurface(azTokenId);
+                QString header = surface.isEmpty() ? tokenId
+                    : QString("%1 (%2)").arg(tokenId, surface);
+                m_bondHeader->setText(QString("Bonds for: %1").arg(header));
+            }
+
+            for (const auto& be : bonds)
+            {
+                auto* item = new QTreeWidgetItem(m_bondTree);
+                item->setText(0, QString::fromUtf8(be.tokenB.c_str(), static_cast<int>(be.tokenB.size())));
+
+                QString surface = ResolveSurface(be.tokenB);
+                if (!surface.isEmpty())
+                    item->setText(1, surface);
+
+                item->setText(2, QString::number(be.count));
+                item->setTextAlignment(2, Qt::AlignRight);
+                item->setData(0, Qt::UserRole,
+                    QString::fromUtf8(be.tokenB.c_str(), static_cast<int>(be.tokenB.size())));
+            }
+
+            m_bondTree->sortByColumn(2, Qt::DescendingOrder);
+            return;
         }
-        else
+
+        // Socket fallback
+        if (m_client && m_client->IsConnected())
         {
-            QString surfaceStr = ResolveSurface(azTokenId, m_engine->GetVocabulary());
-            QString surfaceQ = surfaceStr.isEmpty() ? tokenId
-                : QString("%1 (%2)").arg(tokenId, surfaceStr);
-            m_bondHeader->setText(QString("Bonds for: %1").arg(surfaceQ));
+            m_client->GetBonds(docId, tokenId, [this, tokenId](const QJsonObject& resp) {
+                if (resp["status"].toString() != "ok") return;
+
+                m_bondTree->clear();
+                QJsonArray bonds = resp["bonds"].toArray();
+
+                if (tokenId.isEmpty())
+                {
+                    m_bondHeader->setText(QString("Top starters (%1 shown)").arg(bonds.size()));
+                }
+                else
+                {
+                    QString surface = resp["surface"].toString();
+                    QString header = surface.isEmpty() ? tokenId
+                        : QString("%1 (%2)").arg(tokenId, surface);
+                    m_bondHeader->setText(QString("Bonds for: %1").arg(header));
+                }
+
+                for (int i = 0; i < bonds.size(); ++i)
+                {
+                    QJsonObject be = bonds[i].toObject();
+                    auto* item = new QTreeWidgetItem(m_bondTree);
+                    item->setText(0, be["token"].toString());
+                    item->setText(1, be["surface"].toString());
+                    item->setText(2, QString::number(be["count"].toInt()));
+                    item->setTextAlignment(2, Qt::AlignRight);
+                    item->setData(0, Qt::UserRole, be["token"].toString());
+                }
+
+                m_bondTree->sortByColumn(2, Qt::DescendingOrder);
+            });
         }
-
-        for (const auto& be : bonds)
-        {
-            auto* item = new QTreeWidgetItem(m_bondTree);
-            item->setText(0, QString::fromUtf8(be.tokenB.c_str(),
-                static_cast<int>(be.tokenB.size())));
-
-            QString surface = ResolveSurface(be.tokenB, m_engine->GetVocabulary());
-            if (!surface.isEmpty())
-                item->setText(1, surface);
-
-            item->setText(2, QString::number(be.count));
-            item->setTextAlignment(2, Qt::AlignRight);
-            item->setData(0, Qt::UserRole,
-                QString::fromUtf8(be.tokenB.c_str(), static_cast<int>(be.tokenB.size())));
-        }
-
-        m_bondTree->sortByColumn(2, Qt::DescendingOrder);
     }
 
-    void HCPWorkstationWindow::ShowVars(const QString& docId, const QString& filterEntityId)
+    void HCPWorkstationWindow::ShowVars(
+        const QString& docId, [[maybe_unused]] const QString& filterEntityId)
     {
         m_varTree->clear();
-        if (!m_engine) return;
 
-        auto& wk = m_engine->GetWriteKernel();
-        AZStd::string azDocId(docId.toUtf8().constData());
-        int docPk = wk.GetDocPk(azDocId);
-        if (docPk == 0) return;
-
-        auto vars = wk.GetDocVarsExtended(docPk);
-
-        for (const auto& v : vars)
+        // Direct DB path
+        if (m_engine && m_engine->IsDbConnected() && m_selectedDocPk > 0)
         {
-            if (!filterEntityId.isEmpty())
+            auto vars = m_engine->GetDocVarQuery().GetDocVarsExtended(m_selectedDocPk);
+            for (const auto& v : vars)
             {
-                QString sugId = QString::fromUtf8(v.suggestedId.c_str(),
-                    static_cast<int>(v.suggestedId.size()));
-                if (sugId != filterEntityId)
-                    continue;
-            }
+                auto* item = new QTreeWidgetItem(m_varTree);
+                item->setText(0, QString::fromUtf8(v.surface.c_str(), static_cast<int>(v.surface.size())));
+                item->setText(1, QString::fromUtf8(v.varId.c_str(), static_cast<int>(v.varId.size())));
+                item->setText(2, QString::fromUtf8(v.category.c_str(), static_cast<int>(v.category.size())));
+                item->setText(3, v.groupId ? QString::number(v.groupId) : "-");
+                item->setText(4, v.suggestedId.empty() ? "-" :
+                    QString::fromUtf8(v.suggestedId.c_str(), static_cast<int>(v.suggestedId.size())));
 
-            auto* item = new QTreeWidgetItem(m_varTree);
-            item->setText(0, QString::fromUtf8(v.surface.c_str(),
-                static_cast<int>(v.surface.size())));
-            item->setText(1, QString::fromUtf8(v.varId.c_str(),
-                static_cast<int>(v.varId.size())));
-            item->setText(2, QString::fromUtf8(v.category.c_str(),
-                static_cast<int>(v.category.size())));
-            item->setText(3, v.groupId ? QString::number(v.groupId) : QString("-"));
-            item->setText(4, v.suggestedId.empty() ? QString("-")
-                : QString::fromUtf8(v.suggestedId.c_str(),
-                    static_cast<int>(v.suggestedId.size())));
+                // Category-based styling (matches editor widget)
+                if (v.category == "proper")
+                {
+                    QFont f = item->font(0);
+                    f.setBold(true);
+                    item->setFont(0, f);
+                }
+                else if (v.category == "sic")
+                {
+                    QFont f = item->font(0);
+                    f.setItalic(true);
+                    item->setFont(0, f);
+                }
+                else if (v.category == "uri_metadata")
+                {
+                    item->setForeground(0, QBrush(QColor(128, 128, 128)));
+                }
 
-            item->setData(0, Qt::UserRole,
-                QString::fromUtf8(v.suggestedId.c_str(),
-                    static_cast<int>(v.suggestedId.size())));
+                item->setData(0, Qt::UserRole,
+                    QString::fromUtf8(v.suggestedId.c_str(), static_cast<int>(v.suggestedId.size())));
+            }
+            return;
+        }
 
-            if (v.category == "proper")
-            {
-                QFont f = item->font(0);
-                f.setBold(true);
-                item->setFont(0, f);
-            }
-            else if (v.category == "sic")
-            {
-                QFont f = item->font(0);
-                f.setItalic(true);
-                item->setFont(0, f);
-            }
-            else if (v.category == "uri_metadata")
-            {
-                item->setForeground(0, QBrush(QColor(128, 128, 128)));
-            }
+        // Socket fallback
+        if (m_client && m_client->IsConnected())
+        {
+            m_client->GetDocumentInfo(docId, [this](const QJsonObject& resp) {
+                if (resp["status"].toString() != "ok") return;
+
+                m_varTree->clear();
+                QJsonArray vars = resp["vars"].toArray();
+                for (int i = 0; i < vars.size(); ++i)
+                {
+                    QJsonObject v = vars[i].toObject();
+                    auto* item = new QTreeWidgetItem(m_varTree);
+                    item->setText(0, v["surface"].toString());
+                    item->setText(1, v["var_id"].toString());
+                    item->setText(2, v.value("category").toString("-"));
+                    item->setText(3, v.contains("group_id") ? QString::number(v["group_id"].toInt()) : "-");
+                    item->setText(4, v.value("suggested_entity").toString("-"));
+                    item->setData(0, Qt::UserRole, v.value("suggested_entity").toString());
+                }
+            });
         }
     }
 
     void HCPWorkstationWindow::ShowText(const QString& docId)
     {
-        if (!m_engine) return;
+        m_textView->setPlainText("Loading...");
 
-        auto& wk = m_engine->GetWriteKernel();
-        AZStd::string azDocId(docId.toUtf8().constData());
+        AZStd::string azDocId(docId.toUtf8().constData(), docId.toUtf8().size());
 
-        auto tokenIds = wk.LoadPositions(azDocId);
-        if (tokenIds.empty())
+        // Direct DB + vocab path — reconstruct text from positional tokens
+        if (m_engine && m_engine->IsDbConnected() && m_engine->IsVocabLoaded())
         {
-            m_textView->setPlainText("(no positions stored)");
+            auto tokenIds = m_engine->GetPbmReader().LoadPositions(azDocId);
+            if (tokenIds.empty())
+            {
+                m_textView->setPlainText("(no text stored)");
+                return;
+            }
+
+            AZStd::string text = TokenIdsToText(tokenIds, m_engine->GetVocabulary());
+            if (text.empty())
+                m_textView->setPlainText("(reconstruction failed)");
+            else
+                m_textView->setPlainText(
+                    QString::fromUtf8(text.c_str(), static_cast<int>(text.size())));
             return;
         }
 
-        AZStd::string text = TokenIdsToText(tokenIds, m_engine->GetVocabulary());
-        m_textView->setPlainText(
-            QString::fromUtf8(text.c_str(), static_cast<int>(text.size())));
+        // Socket fallback
+        if (m_client && m_client->IsConnected())
+        {
+            m_client->RetrieveText(docId, [this](const QJsonObject& resp) {
+                if (resp["status"].toString() != "ok")
+                {
+                    m_textView->setPlainText(
+                        QString("Error: %1").arg(resp["message"].toString("Unknown error")));
+                    return;
+                }
+
+                QString text = resp["text"].toString();
+                if (text.isEmpty())
+                    m_textView->setPlainText("(no text stored)");
+                else
+                    m_textView->setPlainText(text);
+            });
+        }
     }
 
     // ---- Slot handlers ----
@@ -771,23 +938,49 @@ namespace HCPEngine
 
     void HCPWorkstationWindow::OnSaveMetadata()
     {
-        if (m_selectedDocPk == 0 || !m_engine) return;
+        if (m_selectedDocId.isEmpty()) return;
 
         QString key = m_metaKeyInput->text().trimmed();
         QString value = m_metaValueInput->text().trimmed();
         if (key.isEmpty()) return;
 
-        auto& wk = m_engine->GetWriteKernel();
-        AZStd::string setJson = "{\"" +
-            AZStd::string(key.toUtf8().constData()) + "\":\"" +
-            AZStd::string(value.toUtf8().constData()) + "\"}";
+        // Direct DB path
+        if (m_engine && m_engine->IsDbConnected() && m_selectedDocPk > 0)
+        {
+            AZStd::string azKey(key.toUtf8().constData(), key.toUtf8().size());
+            AZStd::string azVal(value.toUtf8().constData(), value.toUtf8().size());
+            bool ok = m_engine->GetDocumentQuery().StoreMetadata(m_selectedDocPk, azKey, azVal);
+            if (ok)
+            {
+                m_metaKeyInput->clear();
+                m_metaValueInput->clear();
+                ShowDocumentInfo(m_selectedDocId);
+            }
+            else
+            {
+                statusBar()->showMessage("Metadata save failed", 5000);
+            }
+            return;
+        }
 
-        AZStd::vector<AZStd::string> removeKeys;
-        wk.UpdateMetadata(m_selectedDocPk, setJson, removeKeys);
+        // Socket fallback
+        if (m_client && m_client->IsConnected())
+        {
+            QJsonObject setFields;
+            setFields[key] = value;
 
-        m_metaKeyInput->clear();
-        m_metaValueInput->clear();
-        ShowDocumentInfo(m_selectedDocId);
+            m_client->UpdateMeta(m_selectedDocId, setFields, {}, [this](const QJsonObject& resp) {
+                if (resp["status"].toString() != "ok")
+                {
+                    statusBar()->showMessage(
+                        QString("Metadata error: %1").arg(resp["message"].toString()), 5000);
+                    return;
+                }
+                m_metaKeyInput->clear();
+                m_metaValueInput->clear();
+                ShowDocumentInfo(m_selectedDocId);
+            });
+        }
     }
 
     void HCPWorkstationWindow::OnSearchBonds()
@@ -795,41 +988,43 @@ namespace HCPEngine
         if (m_selectedDocId.isEmpty()) return;
         QString searchText = m_bondSearch->text().trimmed();
         if (searchText.isEmpty()) return;
-        if (!m_engine) return;
 
-        auto& wk = m_engine->GetWriteKernel();
-        AZStd::string azDocId(m_selectedDocId.toUtf8().constData());
-        int docPk = wk.GetDocPk(azDocId);
-        if (docPk == 0) return;
-
-        auto allStarters = wk.GetAllStarters(docPk);
-        m_bondTree->clear();
-        int matchCount = 0;
-
-        for (const auto& be : allStarters)
+        // Direct DB path — local bond search with surface resolution
+        if (m_engine && m_engine->IsDbConnected() && m_engine->IsVocabLoaded() && m_selectedDocPk > 0)
         {
-            AZStd::string azToken(be.tokenB);
-            QString surface = ResolveSurface(azToken, m_engine->GetVocabulary());
-            if (surface.isEmpty())
-                surface = QString::fromUtf8(be.tokenB.c_str(), static_cast<int>(be.tokenB.size()));
+            auto allStarters = m_engine->GetBondQuery().GetAllStarters(m_selectedDocPk);
 
-            if (surface.contains(searchText, Qt::CaseInsensitive))
+            m_bondTree->clear();
+            int matchCount = 0;
+
+            for (const auto& be : allStarters)
             {
-                auto* item = new QTreeWidgetItem(m_bondTree);
-                item->setText(0, QString::fromUtf8(be.tokenB.c_str(),
-                    static_cast<int>(be.tokenB.size())));
-                item->setText(1, surface);
-                item->setText(2, QString::number(be.count));
-                item->setTextAlignment(2, Qt::AlignRight);
-                item->setData(0, Qt::UserRole,
-                    QString::fromUtf8(be.tokenB.c_str(), static_cast<int>(be.tokenB.size())));
-                ++matchCount;
+                QString surface = ResolveSurface(be.tokenB);
+                if (surface.isEmpty())
+                    surface = QString::fromUtf8(be.tokenB.c_str(), static_cast<int>(be.tokenB.size()));
+
+                if (surface.contains(searchText, Qt::CaseInsensitive))
+                {
+                    auto* item = new QTreeWidgetItem(m_bondTree);
+                    item->setText(0, QString::fromUtf8(be.tokenB.c_str(), static_cast<int>(be.tokenB.size())));
+                    item->setText(1, surface);
+                    item->setText(2, QString::number(be.count));
+                    item->setTextAlignment(2, Qt::AlignRight);
+                    item->setData(0, Qt::UserRole,
+                        QString::fromUtf8(be.tokenB.c_str(), static_cast<int>(be.tokenB.size())));
+                    ++matchCount;
+                }
             }
+
+            m_bondHeader->setText(QString("Search: \"%1\" (%2 matches from %3 starters)")
+                .arg(searchText).arg(matchCount).arg(allStarters.size()));
+            m_bondTree->sortByColumn(2, Qt::DescendingOrder);
+            return;
         }
 
-        m_bondHeader->setText(QString("Search: \"%1\" (%2 matches from %3 starters)")
-            .arg(searchText).arg(matchCount).arg(allStarters.size()));
-        m_bondTree->sortByColumn(2, Qt::DescendingOrder);
+        // No local search capability without DB + vocab
+        statusBar()->showMessage(
+            "Bond search requires local DB connection or engine daemon", 5000);
     }
 
     void HCPWorkstationWindow::OnClearBondSearch()
@@ -841,21 +1036,21 @@ namespace HCPEngine
 
     void HCPWorkstationWindow::OnImportMetadata()
     {
-        if (m_selectedDocPk == 0 || m_selectedDocId.isEmpty() || !m_engine) return;
+        if (m_selectedDocId.isEmpty()) return;
 
-        auto& wk = m_engine->GetWriteKernel();
-        AZStd::string azDocId(m_selectedDocId.toUtf8().constData());
-
-        auto detail = wk.GetDocumentDetail(azDocId);
-        QString docName = QString::fromUtf8(detail.name.c_str(),
-            static_cast<int>(detail.name.size()));
-
-        auto prov = wk.GetProvenance(m_selectedDocPk);
+        // Get current document name for catalog matching
+        QString docName = m_infoName->text();
         QString catalogId;
-        if (prov.found && !prov.catalogId.empty())
-            catalogId = QString::fromUtf8(prov.catalogId.c_str(),
-                static_cast<int>(prov.catalogId.size()));
 
+        // Try provenance for catalog ID (direct DB)
+        if (m_engine && m_engine->IsDbConnected() && m_selectedDocPk > 0)
+        {
+            auto prov = m_engine->GetDocumentQuery().GetProvenance(m_selectedDocPk);
+            if (prov.found)
+                catalogId = QString::fromUtf8(prov.catalogId.c_str(), static_cast<int>(prov.catalogId.size()));
+        }
+
+        // Search local Gutenberg catalog files
         static const char* gutenbergFiles[] = {
             "/opt/project/repo/data/gutenberg/metadata.json",
             "/opt/project/repo/data/gutenberg/metadata_batch2.json"
@@ -898,32 +1093,53 @@ namespace HCPEngine
 
         if (!found)
         {
-            m_bondHeader->setText(QString("No catalog match found for \"%1\"").arg(docName));
+            statusBar()->showMessage(
+                QString("No catalog match found for \"%1\"").arg(docName), 5000);
             return;
         }
 
-        QJsonObject meta;
+        // Build metadata fields
+        QJsonObject setFields;
         if (matchedEntry.contains("title"))
-            meta["title"] = matchedEntry["title"];
+            setFields["title"] = matchedEntry["title"];
         if (matchedEntry.contains("authors"))
-            meta["authors"] = matchedEntry["authors"];
+            setFields["authors"] = matchedEntry["authors"];
         if (matchedEntry.contains("subjects"))
-            meta["subjects"] = matchedEntry["subjects"];
+            setFields["subjects"] = matchedEntry["subjects"];
         if (matchedEntry.contains("bookshelves"))
-            meta["bookshelves"] = matchedEntry["bookshelves"];
+            setFields["bookshelves"] = matchedEntry["bookshelves"];
         if (matchedEntry.contains("languages"))
-            meta["languages"] = matchedEntry["languages"];
+            setFields["languages"] = matchedEntry["languages"];
         if (matchedEntry.contains("copyright"))
-            meta["copyright"] = matchedEntry["copyright"];
+            setFields["copyright"] = matchedEntry["copyright"];
         if (matchedEntry.contains("id"))
-            meta["gutenberg_id"] = matchedEntry["id"];
+            setFields["gutenberg_id"] = matchedEntry["id"];
 
-        QJsonDocument metaDoc(meta);
-        QByteArray metaBytes = metaDoc.toJson(QJsonDocument::Compact);
-        AZStd::string metaJson(metaBytes.constData(), metaBytes.size());
+        // Write via direct DB
+        if (m_engine && m_engine->IsDbConnected() && m_selectedDocPk > 0)
+        {
+            QString metaJson = QString::fromUtf8(
+                QJsonDocument(setFields).toJson(QJsonDocument::Compact));
+            AZStd::string azJson(metaJson.toUtf8().constData(), metaJson.toUtf8().size());
+            bool ok = m_engine->GetDocumentQuery().StoreDocumentMetadata(m_selectedDocPk, azJson);
+            if (ok)
+                ShowDocumentInfo(m_selectedDocId);
+            else
+                statusBar()->showMessage("Import failed: DB write error", 5000);
+            return;
+        }
 
-        wk.StoreDocumentMetadata(m_selectedDocPk, metaJson);
-        ShowDocumentInfo(m_selectedDocId);
+        // Socket fallback
+        if (m_client && m_client->IsConnected())
+        {
+            m_client->UpdateMeta(m_selectedDocId, setFields, {}, [this](const QJsonObject& resp) {
+                if (resp["status"].toString() == "ok")
+                    ShowDocumentInfo(m_selectedDocId);
+                else
+                    statusBar()->showMessage(
+                        QString("Import error: %1").arg(resp["message"].toString()), 5000);
+            });
+        }
     }
 
     void HCPWorkstationWindow::OnVarClicked(QTreeWidgetItem* item, [[maybe_unused]] int column)
@@ -968,7 +1184,7 @@ namespace HCPEngine
         m_breadcrumbReset->setVisible(true);
     }
 
-    // ---- File ingestion ----
+    // ---- File ingestion (requires daemon for physics pipeline) ----
 
     void HCPWorkstationWindow::OnOpenFile()
     {
@@ -1023,8 +1239,7 @@ namespace HCPEngine
         QStringList filters = {"*.json", "*.txt", "*.md"};
         QFileInfoList files = dir.entryInfoList(filters, QDir::Files);
 
-        // First pass: pair JSONs with source files
-        QMap<QString, QString> jsonSources; // baseName -> json path
+        QMap<QString, QString> jsonSources;
         QStringList orphanTexts;
 
         for (const QFileInfo& fi : files)
@@ -1039,7 +1254,6 @@ namespace HCPEngine
 
             if (jsonSources.contains(fi.baseName()))
             {
-                // Paired: JSON has metadata, text file is the source
                 IngestJsonSource(jsonSources[fi.baseName()]);
                 jsonSources.remove(fi.baseName());
             }
@@ -1049,15 +1263,11 @@ namespace HCPEngine
             }
         }
 
-        // Remaining JSONs without text pair
         for (const QString& jsonPath : jsonSources.values())
             IngestJsonSource(jsonPath);
 
-        // Orphan text files
         for (const QString& textPath : orphanTexts)
             IngestRawText(textPath);
-
-        PopulateDocumentList();
     }
 
     void HCPWorkstationWindow::IngestJsonSource(const QString& jsonPath)
@@ -1072,19 +1282,16 @@ namespace HCPEngine
 
         QJsonObject obj = jdoc.object();
 
-        // Try to find referenced source file
         QString sourcePath;
         if (obj.contains("source_file"))
         {
             sourcePath = obj["source_file"].toString();
-            // Resolve relative to JSON location
             QFileInfo jsonFi(jsonPath);
             QFileInfo sourceFi(jsonFi.dir(), sourcePath);
             if (sourceFi.exists())
                 sourcePath = sourceFi.absoluteFilePath();
         }
 
-        // If no explicit source_file, look for paired .txt/.md
         if (sourcePath.isEmpty())
         {
             QFileInfo fi(jsonPath);
@@ -1115,7 +1322,6 @@ namespace HCPEngine
         if (docName.isEmpty())
             docName = QFileInfo(sourcePath).baseName();
 
-        // Extract metadata JSON (everything except source_file field)
         QJsonObject meta = obj;
         meta.remove("source_file");
         QString metaJson = QString::fromUtf8(
@@ -1138,39 +1344,35 @@ namespace HCPEngine
     void HCPWorkstationWindow::ProcessThroughPipeline(
         const QString& docName, const QByteArray& rawBytes, const QString& metadataJson)
     {
-        if (!m_engine || !m_engine->IsEngineReady()) return;
+        // Ingestion requires daemon (physics pipeline)
+        if (!m_client || !m_client->IsConnected())
+        {
+            statusBar()->showMessage(
+                "Ingestion requires engine daemon connection (physics pipeline)", 5000);
+            return;
+        }
 
         m_progressBar->setVisible(true);
-        m_progressBar->setRange(0, 0); // indeterminate
+        m_progressBar->setRange(0, 0);
 
-        AZStd::string text(rawBytes.constData(), rawBytes.size());
-        AZStd::string name(docName.toUtf8().constData());
+        QString text = QString::fromUtf8(rawBytes);
 
-        // Process through the HCP pipeline via EBus (ProcessText is protected)
-        AZStd::string docId;
-        HCPEngineRequestBus::BroadcastResult(docId, &HCPEngineRequests::ProcessText, text, name, AZStd::string("AS"));
+        m_client->Ingest(text, docName, metadataJson,
+            [this, docName](const QJsonObject& resp) {
+                m_progressBar->setVisible(false);
 
-        if (!docId.empty() && !metadataJson.isEmpty())
-        {
-            auto& wk = m_engine->GetWriteKernel();
-            int docPk = wk.GetDocPk(docId);
-            if (docPk > 0)
-            {
-                AZStd::string metaJson(metadataJson.toUtf8().constData());
-                wk.StoreDocumentMetadata(docPk, metaJson);
-            }
-        }
+                if (resp["status"].toString() != "ok")
+                {
+                    statusBar()->showMessage(
+                        QString("Ingest error: %1").arg(resp["message"].toString()), 5000);
+                    return;
+                }
 
-        m_progressBar->setVisible(false);
-
-        if (!docId.empty())
-        {
-            PopulateDocumentList();
-            statusBar()->showMessage(
-                QString("Ingested: %1 -> %2").arg(docName,
-                    QString::fromUtf8(docId.c_str(), static_cast<int>(docId.size()))),
-                5000);
-        }
+                PopulateDocumentList();
+                statusBar()->showMessage(
+                    QString("Ingested: %1 -> %2").arg(docName, resp["doc_id"].toString()),
+                    5000);
+            });
     }
 
 } // namespace HCPEngine

@@ -1,56 +1,40 @@
-/// HCP Source Workstation — Standalone Entry Point
+/// HCP Source Workstation — Dual-mode entry point.
 ///
-/// Bootstraps the HCPEngine system component outside the O3DE Editor lifecycle,
-/// then launches the Qt main window.
+/// Initializes both:
+///   1. HCPWorkstationEngine (embedded DB kernels + LMDB vocab) for offline browsing
+///   2. HCPSocketClient (daemon connection) for physics operations
+///
+/// The workstation works without a daemon for data browsing and editing.
+/// Physics operations (ingest, tokenize, phys_resolve) require the daemon.
 
+#include "HCPWorkstationEngine.h"
 #include "HCPWorkstationWindow.h"
-#include "../HCPEngineSystemComponent.h"
-
-#include <AzCore/Memory/SystemAllocator.h>
+#include "HCPSocketClient.h"
 
 #include <QApplication>
 #include <QStyleFactory>
 #include <QCommandLineParser>
+#include <QProcess>
 
 #include <cstdio>
-
-namespace HCPEngine
-{
-    /// Standalone bootstrap wrapper — exposes protected AZ::Component lifecycle
-    /// for use outside the O3DE entity system.
-    class StandaloneEngine : public HCPEngineSystemComponent
-    {
-    public:
-        void StartUp()
-        {
-            Init();
-            Activate();
-        }
-
-        void ShutDown()
-        {
-            Deactivate();
-        }
-
-        /// Expose ProcessText for the workstation's pipeline ingestion.
-        AZStd::string IngestText(
-            const AZStd::string& text,
-            const AZStd::string& docName,
-            const AZStd::string& centuryCode)
-        {
-            return ProcessText(text, docName, centuryCode);
-        }
-    };
-} // namespace HCPEngine
 
 namespace
 {
     struct WorkstationConfig
     {
-        bool gpuMode = true;
-        const char* dbBackend = "postgres";
-        const char* dbConnection = nullptr;
-        const char* vocabPath = nullptr;
+        // Daemon connection
+        QString host = "127.0.0.1";
+        quint16 port = 9720;
+        bool spawnDaemon = false;
+        QString daemonPath;
+
+        // Direct DB access
+        QString dbConnection;  // libpq connection string (empty = default)
+        QString vocabPath;     // LMDB vocab directory (empty = default)
+
+        // Entity DBs (optional)
+        QString ficEntConnection;
+        QString nfEntConnection;
     };
 
     WorkstationConfig ParseCommandLine(QApplication& app)
@@ -62,46 +46,50 @@ namespace
         parser.addHelpOption();
         parser.addVersionOption();
 
-        QCommandLineOption cpuOption("cpu", "Force CPU-only mode (no GPU acceleration)");
-        parser.addOption(cpuOption);
+        // Daemon connection options
+        QCommandLineOption hostOption("host",
+            "Engine daemon host (default: 127.0.0.1)", "address", "127.0.0.1");
+        parser.addOption(hostOption);
 
-        QCommandLineOption dbOption("db",
-            "Database backend: postgres (default) or sqlite", "backend", "postgres");
+        QCommandLineOption portOption("port",
+            "Engine daemon port (default: 9720)", "port", "9720");
+        parser.addOption(portOption);
+
+        QCommandLineOption spawnOption("spawn-daemon",
+            "Spawn the engine daemon on startup and kill on exit");
+        parser.addOption(spawnOption);
+
+        QCommandLineOption daemonPathOption("daemon-path",
+            "Path to the engine daemon binary (HeadlessServerLauncher)", "path");
+        parser.addOption(daemonPathOption);
+
+        // Direct DB options
+        QCommandLineOption dbOption("db-connection",
+            "PostgreSQL connection string for hcp_fic_pbm (default: local dev)", "conninfo");
         parser.addOption(dbOption);
 
-        QCommandLineOption dbConnOption("db-connection",
-            "Database connection string", "connstr");
-        parser.addOption(dbConnOption);
-
         QCommandLineOption vocabOption("vocab",
-            "LMDB vocabulary path", "path");
+            "LMDB vocabulary directory path", "path");
         parser.addOption(vocabOption);
+
+        QCommandLineOption ficEntOption("fic-entities-db",
+            "PostgreSQL connection string for hcp_fic_entities", "conninfo");
+        parser.addOption(ficEntOption);
+
+        QCommandLineOption nfEntOption("nf-entities-db",
+            "PostgreSQL connection string for hcp_nf_entities", "conninfo");
+        parser.addOption(nfEntOption);
 
         parser.process(app);
 
-        if (parser.isSet(cpuOption))
-            config.gpuMode = false;
-
-        if (parser.isSet(dbOption))
-        {
-            static QByteArray dbVal;
-            dbVal = parser.value(dbOption).toUtf8();
-            config.dbBackend = dbVal.constData();
-        }
-
-        if (parser.isSet(dbConnOption))
-        {
-            static QByteArray connVal;
-            connVal = parser.value(dbConnOption).toUtf8();
-            config.dbConnection = connVal.constData();
-        }
-
-        if (parser.isSet(vocabOption))
-        {
-            static QByteArray vocabVal;
-            vocabVal = parser.value(vocabOption).toUtf8();
-            config.vocabPath = vocabVal.constData();
-        }
+        config.host = parser.value(hostOption);
+        config.port = static_cast<quint16>(parser.value(portOption).toUInt());
+        config.spawnDaemon = parser.isSet(spawnOption);
+        config.daemonPath = parser.value(daemonPathOption);
+        config.dbConnection = parser.value(dbOption);
+        config.vocabPath = parser.value(vocabOption);
+        config.ficEntConnection = parser.value(ficEntOption);
+        config.nfEntConnection = parser.value(nfEntOption);
 
         return config;
     }
@@ -109,10 +97,9 @@ namespace
 
 int main(int argc, char* argv[])
 {
-    // Initialize Qt
     QApplication app(argc, argv);
     app.setApplicationName("HCP Source Workstation");
-    app.setApplicationVersion("1.0.0");
+    app.setApplicationVersion("0.1.0-alpha");
     app.setOrganizationName("HCP");
 
     // Dark fusion style
@@ -135,35 +122,74 @@ int main(int argc, char* argv[])
 
     WorkstationConfig config = ParseCommandLine(app);
 
-    fprintf(stderr, "[HCP Workstation] Starting...\n");
-    fprintf(stderr, "  GPU mode: %s\n", config.gpuMode ? "enabled" : "disabled (CPU only)");
-    fprintf(stderr, "  DB backend: %s\n", config.dbBackend);
+    fprintf(stderr, "[HCP Workstation] Starting (v%s)...\n",
+        app.applicationVersion().toUtf8().constData());
+
+    // ---- Initialize embedded engine (DB kernels + LMDB vocab) ----
+    HCPEngine::HCPWorkstationEngine engine;
+
+    // Keep QByteArrays alive so constData() pointers remain valid
+    QByteArray dbConnBuf = config.dbConnection.toUtf8();
+    QByteArray vocabBuf = config.vocabPath.toUtf8();
+    QByteArray ficEntBuf = config.ficEntConnection.toUtf8();
+    QByteArray nfEntBuf = config.nfEntConnection.toUtf8();
+
+    engine.Initialize(
+        config.dbConnection.isEmpty() ? nullptr : dbConnBuf.constData(),
+        config.vocabPath.isEmpty() ? nullptr : vocabBuf.constData(),
+        config.ficEntConnection.isEmpty() ? nullptr : ficEntBuf.constData(),
+        config.nfEntConnection.isEmpty() ? nullptr : nfEntBuf.constData());
+
+    // ---- Initialize socket client (daemon connection, optional) ----
+    HCPEngine::HCPSocketClient client(config.host, config.port);
+
+    fprintf(stderr, "  DB: %s | Vocab: %s | Daemon: %s:%d\n",
+        engine.IsDbConnected() ? "connected" : "unavailable",
+        engine.IsVocabLoaded() ? "loaded" : "unavailable",
+        config.host.toUtf8().constData(), config.port);
     fflush(stderr);
 
-    // Create and activate the engine via standalone wrapper
-    HCPEngine::StandaloneEngine engine;
-    engine.StartUp();
-
-    if (!engine.IsEngineReady())
+    // Optional daemon management
+    QProcess* daemonProc = nullptr;
+    if (config.spawnDaemon && !config.daemonPath.isEmpty())
     {
-        fprintf(stderr, "[HCP Workstation] WARNING: Engine not fully ready — "
-            "some features may be unavailable\n");
-        fflush(stderr);
-    }
-    else
-    {
-        fprintf(stderr, "[HCP Workstation] Engine initialized successfully\n");
-        fflush(stderr);
+        daemonProc = new QProcess(&app);
+        daemonProc->setProcessChannelMode(QProcess::ForwardedChannels);
+        daemonProc->start(config.daemonPath, QStringList{});
+        if (!daemonProc->waitForStarted(5000))
+        {
+            fprintf(stderr, "[HCP Workstation] WARNING: Failed to spawn daemon: %s\n",
+                config.daemonPath.toUtf8().constData());
+            fflush(stderr);
+        }
+        else
+        {
+            fprintf(stderr, "[HCP Workstation] Spawned daemon (PID %lld)\n",
+                daemonProc->processId());
+            fflush(stderr);
+        }
     }
 
-    // Create and show main window
-    HCPEngine::HCPWorkstationWindow window(&engine);
+    // ---- Create and show main window ----
+    HCPEngine::HCPWorkstationWindow window(&engine, &client);
     window.show();
+
+    // Begin async daemon connection (non-blocking)
+    client.ConnectToEngine();
 
     int result = app.exec();
 
-    // Cleanup
-    engine.ShutDown();
+    // Shutdown
+    engine.Shutdown();
+
+    if (daemonProc && daemonProc->state() != QProcess::NotRunning)
+    {
+        fprintf(stderr, "[HCP Workstation] Stopping daemon...\n");
+        fflush(stderr);
+        daemonProc->terminate();
+        if (!daemonProc->waitForFinished(3000))
+            daemonProc->kill();
+    }
 
     return result;
 }
