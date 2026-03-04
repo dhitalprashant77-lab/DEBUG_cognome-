@@ -32,7 +32,8 @@ namespace HCPEngine
     static constexpr AZ::u32 WS_PRIMARY_MAX_LENGTH = 10;
 
     //! Number of primary workspaces (handle lengths 2-10, bulk of English).
-    static constexpr AZ::u32 WS_PRIMARY_COUNT = 2;
+    //! 3 enables triple-pipeline: one loading (CPU), one simulating (GPU), one draining (CPU).
+    static constexpr AZ::u32 WS_PRIMARY_COUNT = 3;
 
     //! Number of extended workspaces (handle lengths 11-20+, sparse).
     static constexpr AZ::u32 WS_EXTENDED_COUNT = 2;
@@ -262,6 +263,20 @@ namespace HCPEngine
         //! Run phase cascade over a pre-filtered vocab list. Used by ResolveLengthCycle
         //! for both Label and common passes.
         void RunPhaseCascade(
+            AZ::u32 wordLength,
+            const AZStd::vector<CharRun>& runs,
+            const AZStd::vector<VocabPack::Entry>& filteredVocab,
+            AZStd::vector<AZ::u32>& currentIndices,
+            AZStd::vector<ResolutionResult>& results,
+            AZ::u32& phaseIndex);
+
+        //! Pipelined phase cascade — drop-in replacement for RunPhaseCascade.
+        //! Overlaps GPU simulation of phase N with CPU preparation of phase N+1:
+        //!   - VocabPack for N+1 built during GPU sim of N (hidden behind GPU time)
+        //!   - Workspaces that finish phase N immediately start phase N+1 without
+        //!     waiting for other workspaces to complete the same phase
+        //! Requires WS_PRIMARY_COUNT >= 3 for full triple-pipeline benefit.
+        void RunPipelinedCascade(
             AZ::u32 wordLength,
             const AZStd::vector<CharRun>& runs,
             const AZStd::vector<VocabPack::Entry>& filteredVocab,

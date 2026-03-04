@@ -1310,6 +1310,205 @@ namespace HCPEngine
         }
     }
 
+    // ---- RunPipelinedCascade: work-queue state machine that overlaps GPU phases ----
+    //
+    // Replaces the sequential RunPhaseCascade loop. Key differences:
+    //
+    //   Sequential:   [LoadA][SimA][DrainA] | [BuildPack] [LoadA][SimA][DrainA] | ...
+    //                                        ^--- GPU idle here ---^
+    //
+    //   Pipelined:    [Load A+B+C][Sim A+B+C] | [Drain A → reload A, Drain B → reload B, ...]
+    //                 [BuildPack(N+1) during Sim(N)]  ← GPU idle gap eliminated
+    //
+    // With WS_PRIMARY_COUNT=3:
+    //   - ws_A draining phase N-1 results (CPU)
+    //   - ws_B simulating phase N (GPU)
+    //   - ws_C loading phase N+1 vocab + runs (CPU)
+    // → GPU transitions directly from phase N to N+1 without idle gap.
+    //
+    // Work queue:  each item = (vocabStart, absPhaseIdx, runIndices)
+    //   - Initial item: vocabStart=0, runIndices=all input runs
+    //   - On drain: unresolved runs → new item at vocabStart += RC_VOCAB_PER_PHASE
+    //   - On dispatch: leftover (overflow) → re-inserted at queue head (same phase)
+    // VocabPack cache:  built once per vocabStart, never rebuilt.
+    //   Pre-built during dispatch (after BeginSimulate, before FetchSimResults).
+
+    void BedManager::RunPipelinedCascade(
+        AZ::u32 wordLength,
+        const AZStd::vector<CharRun>& runs,
+        const AZStd::vector<VocabPack::Entry>& filteredVocab,
+        AZStd::vector<AZ::u32>& currentIndices,
+        AZStd::vector<ResolutionResult>& results,
+        AZ::u32& phaseIndex)
+    {
+        AZ::u32 totalFiltered = static_cast<AZ::u32>(filteredVocab.size());
+        if (totalFiltered == 0 || currentIndices.empty()) return;
+
+        AZStd::vector<Workspace*> workspaces = GetWorkspacesForLength(wordLength);
+        if (workspaces.empty()) return;
+
+        // --- Work item: a batch of runs to resolve against a specific vocab slice ---
+        struct WorkItem
+        {
+            AZ::u32 vocabStart;               // start offset into filteredVocab
+            AZ::u32 absPhaseIdx;              // for ResolutionResult::tierResolved
+            AZStd::vector<AZ::u32> runIndices;
+        };
+
+        // --- Per-workspace slot state ---
+        struct WsSlot
+        {
+            Workspace* ws          = nullptr;
+            bool       simulating  = false;
+            AZ::u32    absPhaseIdx = 0;
+            AZ::u32    vocabStart  = 0;
+        };
+
+        AZStd::vector<WsSlot> slots;
+        slots.reserve(workspaces.size());
+        for (auto* ws : workspaces)
+            slots.push_back({ws, false, 0, 0});
+
+        // --- VocabPack cache: built once per vocabStart, reused across workspaces ---
+        // Key: vocabStart (= phase * RC_VOCAB_PER_PHASE)
+        // Pointers into this map remain stable across emplace (unordered_map guarantee).
+        AZStd::unordered_map<AZ::u32, VocabPack> packCache;
+        auto getOrBuildPack = [&](AZ::u32 start) -> const VocabPack*
+        {
+            auto it = packCache.find(start);
+            if (it == packCache.end())
+            {
+                auto ins = packCache.emplace(start,
+                    BuildVocabSliceFromEntries(wordLength, filteredVocab, start, RC_VOCAB_PER_PHASE));
+                return &ins.first->second;
+            }
+            return &it->second;
+        };
+
+        // --- Work queue ---
+        // Vector + head index — insert at head for leftover re-queue (same phase must
+        // finish before advancing). Items are never erased; queueHead advances instead.
+        AZStd::vector<WorkItem> workQueue;
+        size_t queueHead = 0;
+
+        workQueue.push_back({0, phaseIndex, AZStd::move(currentIndices)});
+        currentIndices.clear();  // repopulated below with permanently unresolved runs
+
+        AZ::u32 maxAbsPhase = phaseIndex;
+
+        // Pre-build phase-0 pack immediately (no GPU work yet, CPU is free)
+        getOrBuildPack(0);
+
+        // --- Main pipeline loop ---
+        for (;;)
+        {
+            // ===== Step 1: Drain any workspace that has finished simulating =====
+            for (auto& slot : slots)
+            {
+                if (!slot.simulating) continue;
+                if (!slot.ws->IsSimDone()) continue;
+
+                const VocabPack& pack = packCache.at(slot.vocabStart);
+                slot.ws->FetchSimResults();
+                slot.ws->CheckSettlement(0, pack);
+
+                AZStd::vector<ResolutionResult> wsResolved;
+                AZStd::vector<AZ::u32> wsUnresolved;
+                slot.ws->CollectSplit(wsResolved, wsUnresolved);
+
+                for (auto& r : wsResolved)
+                {
+                    r.tierResolved = slot.absPhaseIdx;
+                    results.push_back(AZStd::move(r));
+                }
+
+                if (!wsUnresolved.empty())
+                {
+                    AZ::u32 nextStart = slot.vocabStart + RC_VOCAB_PER_PHASE;
+                    if (nextStart < totalFiltered)
+                    {
+                        AZ::u32 nextPhaseIdx = slot.absPhaseIdx + 1;
+                        if (nextPhaseIdx > maxAbsPhase) maxAbsPhase = nextPhaseIdx;
+                        workQueue.push_back({nextStart, nextPhaseIdx, AZStd::move(wsUnresolved)});
+                    }
+                    else
+                    {
+                        // Vocab exhausted — permanently unresolved
+                        for (AZ::u32 idx : wsUnresolved)
+                            currentIndices.push_back(idx);
+                    }
+                }
+
+                slot.ws->ResetDynamics();
+                slot.ws->DeactivateFromScene();
+                slot.simulating = false;
+            }
+
+            // ===== Step 2: Dispatch idle workspaces from work queue =====
+            for (auto& slot : slots)
+            {
+                if (slot.simulating) continue;
+                if (queueHead >= workQueue.size()) continue;
+
+                WorkItem& item = workQueue[queueHead];
+                if (item.runIndices.empty()) { ++queueHead; continue; }
+
+                const VocabPack* pack = getOrBuildPack(item.vocabStart);
+                if (pack->vocabEntryCount == 0) { ++queueHead; continue; }
+
+                AZStd::vector<AZ::u32> overflow;
+                AZ::u32 offset = 0;
+                bool hasRuns = LoadWorkspaceBatch(slot.ws, wordLength, runs,
+                                                  item.runIndices, offset, *pack, overflow);
+
+                // Collect runs this workspace couldn't fit
+                AZStd::vector<AZ::u32> leftover;
+                for (AZ::u32 j = offset; j < static_cast<AZ::u32>(item.runIndices.size()); ++j)
+                    leftover.push_back(item.runIndices[j]);
+                leftover.insert(leftover.end(), overflow.begin(), overflow.end());
+
+                AZ::u32 savedVocabStart = item.vocabStart;
+                AZ::u32 savedPhaseIdx   = item.absPhaseIdx;
+                ++queueHead;  // consume this item
+
+                if (!leftover.empty())
+                {
+                    // Re-insert leftover at queue head: same phase must complete
+                    // before advancing to the next phase's work items.
+                    workQueue.insert(workQueue.begin() + static_cast<ptrdiff_t>(queueHead),
+                        WorkItem{savedVocabStart, savedPhaseIdx, AZStd::move(leftover)});
+                    // queueHead now points at the re-inserted item (next slot gets it)
+                }
+
+                if (hasRuns)
+                {
+                    slot.ws->BeginSimulate(RC_SETTLE_STEPS, RC_DT);
+                    slot.simulating  = true;
+                    slot.absPhaseIdx = savedPhaseIdx;
+                    slot.vocabStart  = savedVocabStart;
+
+                    // === KEY OPTIMIZATION: pre-build next phase pack while GPU runs ===
+                    // BuildVocabSliceFromEntries is pure CPU/memory work. By building it
+                    // here — after BeginSimulate, before the next FetchSimResults — the
+                    // build time is hidden behind GPU simulation rather than adding to
+                    // the critical path between phases.
+                    AZ::u32 nextStart = savedVocabStart + RC_VOCAB_PER_PHASE;
+                    if (nextStart < totalFiltered)
+                        getOrBuildPack(nextStart);
+                }
+            }
+
+            // ===== Termination check =====
+            bool anySim = false;
+            for (const auto& slot : slots)
+                if (slot.simulating) { anySim = true; break; }
+            if (!anySim && queueHead >= workQueue.size()) break;
+        }
+
+        // Update phase counter for caller (label pass feeds into common pass)
+        phaseIndex = maxAbsPhase + 1;
+    }
+
     void BedManager::ResolveLengthCycle(
         AZ::u32 wordLength,
         const AZStd::vector<CharRun>& runs,
@@ -1369,7 +1568,7 @@ namespace HCPEngine
                     wordLength, capRuns.size(), labelCount, filteredLabels.size());
                 fflush(stderr);
 
-                RunPhaseCascade(wordLength, runs, filteredLabels, capRuns, results, phaseIndex);
+                RunPipelinedCascade(wordLength, runs, filteredLabels, capRuns, results, phaseIndex);
             }
 
             // Unresolved cap runs fall through to common pass
@@ -1402,7 +1601,7 @@ namespace HCPEngine
             fflush(stderr);
 
             if (!filteredCommon.empty())
-                RunPhaseCascade(wordLength, runs, filteredCommon, commonRuns, results, phaseIndex);
+                RunPipelinedCascade(wordLength, runs, filteredCommon, commonRuns, results, phaseIndex);
         }
 
         for (AZ::u32 idx : commonRuns)
