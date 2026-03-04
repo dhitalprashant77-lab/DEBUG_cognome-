@@ -1,6 +1,6 @@
 # Project Status
 
-_Last updated: 2026-03-03_
+_Last updated: 2026-03-04_
 
 ## What Exists
 
@@ -29,20 +29,20 @@ The primary inference engine is an O3DE 25.10.2 C++ Gem using PhysX 5 GPU-accele
 DecodeUtf8ToCodepoints
   -> Phase 1: byte->char PBD superposition (16K codepoints/chunk, Unicode-aware)
   -> ExtractRunsFromCollapses (with capitalization suppression)
-  -> Phase 2: char->word via persistent VocabBeds (BedManager, 4 GPU workspaces)
+  -> Phase 2: char->word via persistent VocabBeds (BedManager, 5 GPU workspaces: 3 primary + 2 extended, triple-pipelined via RunPipelinedCascade)
     -> TryInflectionStrip (PBD is the existence check, silent-e fallback)
     -> AnnotateManifest (multi-word entity recognition)
     -> ScanManifestToPBM
     -> StorePBM + StorePositions
 ```
 
-**Benchmarks (2026-03-02, GTX 1070 headless):**
+**Benchmarks (2026-03-04, GTX 1070 headless, pipelined):**
 
-| Text | Size | Resolution | Phase 1 | Phase 2 | Wall Time |
-|------|------|------------|---------|---------|-----------|
-| Dracula | 890 KB | 98.5% (161,722/164,116) | 7.6s | 145.5s | 166.5s |
-| A Study in Scarlet | 269 KB | 97.5% (46,778/46,683) | 2.4s | 115.0s | 133.0s |
-| Sherlock Holmes | 607 KB | 94.1% (101,490/107,823) | 5.3s | 98.4s | 109.5s |
+| Text | Size | Tokens | Vars | Wall Time | Previous (pre-pipeline) |
+|------|------|--------|------|-----------|--------------------------|
+| Dracula | 890 KB | 199,368 | 110 | **28.6s** | 166.5s (2026-03-02) |
+| A Study in Scarlet | 269 KB | 56,061 | 54 | **12.2s** | 133.0s (2026-03-02) |
+| The Yellow Wallpaper | 47 KB | 10,856 | 37 | — | — |
 
 **Key engine modules** (`hcp-engine/Gem/Source/`):
 
@@ -91,7 +91,7 @@ Offline-compiled LMDB vocabulary for zero-SQL runtime:
 - Frequency data: Wikipedia 2023 + OpenSubtitles merged. 176K tokens ranked.
 - Scripts: `compile_vocab_lmdb.py`, `compile_entity_lmdb.py`, `merge_frequency_ranks.py`
 
-### Database Shards (6 databases, 22 migrations applied)
+### Database Shards (6 databases, 24 migrations applied)
 
 **Core shard (`hcp_core`)** -- AA namespace
 - ~5,200 tokens: byte codes, Unicode characters, structural markers, NSM primitives
@@ -104,6 +104,7 @@ Offline-compiled LMDB vocabulary for zero-SQL runtime:
 - Kaikki dictionary data: 1.3M entries, 1.5M senses, 870K forms, 450K relations
 - Lowercase-normalized (migration 016), particle_key indexed (migration 018)
 - Frequency ranks from OpenSubtitles + Wikipedia (migration 019)
+- Variant form support: `tokens.category` (archaic/dialect/casual/literary) + `tokens.canonical_id` FK (migrations 023-024). 4,815 clean variant entries after Wiktionary data cleanup.
 - All tokens atomized to character Token IDs
 
 **Fiction PBM shard (`hcp_fic_pbm`)** -- v* PBMs
@@ -146,7 +147,8 @@ DB dumps: gzipped with SHA-256 checksums. `load.sh` handles all 6 databases with
 
 ## What's In Progress
 
-- **Triple scene pipeline** -- 3 PxScenes rotating (prep/process/results) for GPU/CPU overlap. Expected to reduce Phase 2 times by 2-3x. Design in `scene_pipeline_design.md`.
+- **V-1/V-3 variant normalization** -- Engine-side `TryVariantNormalize`: V-1 (g-drop `-in'`→`-ing`, HIGH value for dialect speech) and V-3 (archaic `-eth` 3rd person, MEDIUM value). Design and strip order in `docs/variant-rules-proposal.md`.
+- **Envelope-based variant loading** -- Wire variant DB entries (env_archaic / env_dialect / env_casual) into resolve loop with VARIANT morph bits (bits 12-15).
 - **Entity data cleanup** -- Librarian DB has inconsistent naming. Building clean entity DB alongside.
 - **Label propagation** -- If word appears as Label anywhere, restore firstCap on all suppressed instances.
 

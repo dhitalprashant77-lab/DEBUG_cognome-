@@ -64,9 +64,10 @@ Extend the same structural primitives beyond text to other forms of expression.
 - Build covalent bonding tables for non-text formats
 - Cross-modal conceptual mapping via shared NSM primitives
 
-## Current Focus (2026-03-03)
+## Current Focus (2026-03-04)
 
-- **Triple scene pipeline** -- 3 PxScenes rotating (prep/process/results) for full GPU/CPU overlap. Expected 2-3x Phase 2 speedup.
+- **V-1/V-3 variant normalization** -- Engine-side TryVariantNormalize: g-drop dialect forms (`-in'`→`-ing`) and archaic 3rd-person (`-eth`). Design in `docs/variant-rules-proposal.md`.
+- **Envelope-based variant loading** -- Wire variant DB entries (env_archaic / env_dialect / env_casual) with VARIANT morph bits.
 - **Entity data cleanup** -- Building normalized entity DB alongside messy librarian data.
 - **Label propagation** -- Restore firstCap on all instances if word appears as Label anywhere.
 - **Source Workstation** -- Standalone Qt binary for document browsing, metadata editing, entity normalization.
@@ -81,4 +82,4 @@ The HCP operates on this insight: Token IDs and bond strengths are simpler data 
 
 Shards are scene elements. Load the next configuration. Hot-swap context like texture streaming. The game industry solved memory management for exactly this use case decades ago.
 
-**Current benchmark floor** (GTX 1070, 8GB, 15 SMs -- 2016 hardware): full novel processed in under 3 minutes. Modern hardware (RTX 4090: 128 SMs, 24GB) makes everything faster without code changes. Architecture decisions driven by correctness + scalability, not development hardware performance.
+**Current benchmark floor** (GTX 1070, 8GB, 15 SMs -- 2016 hardware): full novel (890KB, Dracula) processed in **28.6 seconds** with triple-pipelined GPU/CPU overlap. Modern hardware (RTX 4090: 128 SMs, 24GB) makes everything faster without code changes. Architecture decisions driven by correctness + scalability, not development hardware performance.

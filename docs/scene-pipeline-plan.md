@@ -2,7 +2,7 @@
 
 **Date**: 2026-03-04
 **Author**: engine-specialist
-**Status**: Planning — awaiting review before implementation
+**Status**: COMPLETED — implemented in commit c7b9cb6 (2026-03-04). `RunPhaseCascade` retained for rollback.
 **Goal**: Eliminate GPU idle gaps between resolution phases (~50% of current wall time)
 
 ---
