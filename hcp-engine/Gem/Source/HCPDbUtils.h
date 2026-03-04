@@ -169,11 +169,16 @@ namespace HCPEngine
             }
         }
 
-        // sic: contains digits or non-alpha/non-space/non-hyphen/non-apostrophe codepoints
+        // number: contains any digit codepoint
         for (AZ::u32 cp : codepoints)
         {
             if (cp >= '0' && cp <= '9')
-                return "sic";
+                return "number";
+        }
+
+        // sic: contains non-alpha/non-space/non-hyphen/non-apostrophe codepoints
+        for (AZ::u32 cp : codepoints)
+        {
             if (!(IsAlphaCodepoint(cp) || cp == ' ' || cp == '-' || cp == '\''))
                 return "sic";
         }

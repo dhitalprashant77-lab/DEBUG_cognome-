@@ -16,8 +16,6 @@ set(FILES
     Source/HCPSocketServer.h
     Source/HCPBondCompiler.cpp
     Source/HCPBondCompiler.h
-    Source/HCPDetectionScene.cpp
-    Source/HCPDetectionScene.h
     Source/HCPCacheMissResolver.cpp
     Source/HCPCacheMissResolver.h
     Source/HCPJsonInterpreter.cpp
@@ -26,7 +24,6 @@ set(FILES
     Source/HCPSuperpositionTrial.h
     Source/HCPWordSuperpositionTrial.cpp
     Source/HCPWordSuperpositionTrial.h
-    Source/HCPResolutionChamber.cpp
     Source/HCPResolutionChamber.h
     Source/HCPVocabBed.cpp
     Source/HCPVocabBed.h

@@ -39,6 +39,10 @@ namespace HCPEngine
                         out += '"';
                         p += 3;
                         continue;
+                    case 0xA2: // U+2022 BULLET → whitespace
+                        out += ' ';
+                        p += 3;
+                        continue;
                     // Em/en-dashes preserved — structural, not typesetting
                     default:
                         break;
@@ -590,9 +594,21 @@ namespace HCPEngine
                 continue;
             }
 
-            // Collect chunk (everything until next whitespace)
+            // Interior boundary chars: / [ ] — emit as single-char tokens, stop chunk here
+            if (c == '/' || c == '[' || c == ']')
+            {
+                AZStd::string cid = vocab.LookupChar(c);
+                if (!cid.empty())
+                    emitToken(AZStd::move(cid));
+                needSpaceGap = false;
+                ++i;
+                continue;
+            }
+
+            // Collect chunk (everything until next whitespace or interior boundary)
             size_t chunkStart = i;
-            while (i < normalized.size() && !IsWhitespace(normalized[i]))
+            while (i < normalized.size() && !IsWhitespace(normalized[i]) &&
+                   normalized[i] != '/' && normalized[i] != '[' && normalized[i] != ']')
                 ++i;
 
             AZStd::string chunk(normalized.data() + chunkStart, i - chunkStart);
@@ -614,10 +630,10 @@ namespace HCPEngine
                 if (hasDotValue)
                 {
                     size_t le = 0;
-                    while (le < chunk.size() && IsPunctuation(chunk[le]) && chunk[le] != '.')
+                    while (le < chunk.size() && IsPunctuation(chunk[le]))
                         ++le;
                     size_t ts = chunk.size();
-                    while (ts > le && IsPunctuation(chunk[ts - 1]) && chunk[ts - 1] != '.')
+                    while (ts > le && IsPunctuation(chunk[ts - 1]))
                         --ts;
 
                     for (size_t j = 0; j < le; ++j)

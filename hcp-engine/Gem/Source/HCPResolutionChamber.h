@@ -2,29 +2,11 @@
 
 #include <AzCore/base.h>
 #include <AzCore/std/containers/vector.h>
-#include <AzCore/std/containers/unordered_map.h>
 #include <AzCore/std/string/string.h>
 #include "HCPWordSuperpositionTrial.h"  // CharRun
 
-// Forward declare libpq connection type (avoids libpq-fe.h in header)
-typedef struct pg_conn PGconn;
-
-// Forward declarations — full PhysX headers only in .cpp
-namespace physx
-{
-    class PxPhysics;
-    class PxScene;
-    class PxCudaContextManager;
-    class PxPBDParticleSystem;
-    class PxParticleBuffer;
-    class PxPBDMaterial;
-}
-
 namespace HCPEngine
 {
-    class HCPVocabulary;
-    class HCPBondTable;
-
     // ---- Morphological bit field (16-bit) ----
     // Each bit records one inflection/contraction applied during resolution.
     // Stored as positional modifiers alongside token_id — zero for bare tokens.
@@ -58,95 +40,7 @@ namespace HCPEngine
     static constexpr int RC_SETTLE_STEPS = 60;
     static constexpr AZ::u32 RC_VOCAB_PER_PHASE = 2000;  // Vocab entries per phase slice (larger = fewer phases, fewer simulate() rounds)
 
-    // Legacy tier constants — used by TierAssembly::AssignTiers (Postgres path).
-    // Will be removed when BedManager switches to LMDB data source.
-    static constexpr int RC_MAX_TIERS = 4;
-    static constexpr AZ::u32 RC_TIER_0_MAX = 500;
-    static constexpr AZ::u32 RC_TIER_1_MAX = 1500;
-    static constexpr AZ::u32 RC_TIER_2_MAX = 5000;
-    static constexpr AZ::u32 RC_STANDARD_BUFFER_CAPACITY = 8192;
-    static constexpr AZ::u32 RC_BATCH_PARTICLE_BUDGET = 100000;  // Max particles per batch (VRAM safety)
-
-    // ---- Tier Assembly (pure CPU) ----
-
-    //! A vocabulary word scored and assigned to a frequency tier.
-    struct TieredVocabEntry
-    {
-        AZStd::string word;       // Lowercase word form
-        AZStd::string tokenId;    // Resolved token ID
-        AZ::u32 bondCount;        // Aggregate PBM bond score (sum of adjacent char-pair bonds)
-        AZ::u32 freqRank;         // Corpus frequency rank (1 = most frequent, 0 = unranked)
-        AZ::u32 tierIndex;        // Assigned tier (0 = highest frequency)
-    };
-
-    //! Vocabulary for one (length, firstChar) chamber bucket.
-    //! All words in this bucket share the same length and starting character.
-    //! Entries are sorted by bondCount descending and assigned to tiers.
-    struct ChamberVocab
-    {
-        AZ::u32 bucketKey;        // (length << 8) | firstCharLower
-        AZ::u32 wordLength;
-        char firstChar;
-        AZStd::vector<TieredVocabEntry> entries;    // Sorted by bondCount desc
-        AZStd::vector<AZ::u32> tierBoundaries;      // Index where each tier starts
-        AZ::u32 tierCount;                           // Number of populated tiers
-    };
-
-    //! Builds tiered vocabulary from PBM bond data + vocabulary.
-    //! Per (length, firstChar) bucket: sorts words by aggregate bond count,
-    //! assigns to tiers (tier 0 = highest freq, tier 1, tier 2).
-    //! Remaining words are excluded (var fallback path).
-    class TierAssembly
-    {
-    public:
-        //! Build tiered vocabulary from bond table and vocabulary.
-        //! Bond count scoring: sum adjacent character pair bond strengths.
-        //! "there" = GetBondStrength("t","h") + GetBondStrength("h","e") + ...
-        void Build(const HCPBondTable& bondTable, const HCPVocabulary& vocab);
-
-        //! Build tiered vocabulary from Postgres via particle_key queries.
-        //! Targeted queries per (firstChar, length) bucket instead of full vocab scan.
-        //! Apostrophe/hyphen words routed to separate punctuation bucket maps.
-        void BuildFromDatabase(PGconn* conn, const HCPBondTable& bondTable);
-
-        //! Look up the vocabulary bucket for a given word length and first character.
-        const ChamberVocab* GetBucket(AZ::u32 wordLength, char firstChar) const;
-
-        //! Get all buckets for a given word length (all firstChar groups).
-        AZStd::vector<const ChamberVocab*> GetBucketsForLength(AZ::u32 wordLength) const;
-
-        //! Get all word lengths that have at least one bucket, sorted descending.
-        AZStd::vector<AZ::u32> GetActiveWordLengths() const;
-
-        size_t BucketCount() const { return m_buckets.size(); }
-        size_t TotalWords() const { return m_totalWords; }
-
-        void LogStats() const;
-
-        static AZ::u32 MakeBucketKey(AZ::u32 len, char firstChar);
-
-        //! Punctuation-bucketed vocab (apostrophe/hyphen words from BuildFromDatabase).
-        const auto& GetApostropheBuckets() const { return m_apostropheBuckets; }
-        const auto& GetHyphenBuckets() const { return m_hyphenBuckets; }
-
-    private:
-
-        //! Sort bucket by bondCount, truncate to tier capacity, assign tier indices.
-        void AssignTiers(ChamberVocab& bucket);
-
-        AZStd::unordered_map<AZ::u32, ChamberVocab> m_buckets;
-        AZStd::unordered_map<char, ChamberVocab> m_apostropheBuckets;
-        AZStd::unordered_map<char, ChamberVocab> m_hyphenBuckets;
-        size_t m_totalWords = 0;
-    };
-
-    //! Compute aggregate bond count for a word using the bond table.
-    //! Sum of GetBondStrength(char[i], char[i+1]) for all adjacent pairs.
-    AZ::u32 ComputeWordBondCount(const AZStd::string& word, const HCPBondTable& bondTable);
-
-    // ---- Resolution Chamber (GPU, implemented in Steps 2-5) ----
-
-    //! Tracking slot for a stream run loaded into a chamber buffer.
+    //! Tracking slot for a stream run loaded into a workspace buffer.
     struct StreamRunSlot
     {
         AZ::u32 runIndex;          // Index into the original runs array
@@ -159,16 +53,6 @@ namespace HCPEngine
         AZ::u32 tierResolved = 0xFF;  // Which tier resolved it (0xFF = unresolved)
         bool firstCap = false;     // Positional cap data from original CharRun
         bool allCaps = false;
-    };
-
-    //! Tracking slot for a vocab word in the chamber buffer.
-    struct VocabWordSlot
-    {
-        AZ::u32 tierIndex;
-        AZ::u32 entryIndex;        // Index into ChamberVocab::entries
-        AZ::u32 bufferStart;       // First particle index in the buffer
-        AZ::u32 charCount;
-        AZ::u32 runSlotIndex;      // Which stream run this vocab copy serves
     };
 
     //! Result for a single run's resolution.
@@ -201,83 +85,6 @@ namespace HCPEngine
         AZ::u32 resolvedRuns = 0;
         AZ::u32 unresolvedRuns = 0;
         float totalTimeMs = 0.0f;
-    };
-
-    //! One resolution chamber per (length, firstChar) group.
-    //! Contains one PBD system + buffer with tiered vocab and stream runs.
-    class ResolutionChamber
-    {
-    public:
-        ResolutionChamber() = default;
-        ~ResolutionChamber();
-
-        // Non-copyable (owns GPU resources)
-        ResolutionChamber(const ResolutionChamber&) = delete;
-        ResolutionChamber& operator=(const ResolutionChamber&) = delete;
-        ResolutionChamber(ResolutionChamber&& other) noexcept;
-        ResolutionChamber& operator=(ResolutionChamber&& other) noexcept;
-
-        bool Initialize(
-            physx::PxPhysics* physics,
-            physx::PxScene* scene,
-            physx::PxCudaContextManager* cuda,
-            const ChamberVocab& vocab);
-
-        void LoadRuns(const AZStd::vector<CharRun>& runs,
-                      const AZStd::vector<AZ::u32>& runIndices);
-
-        bool SimulateTier(AZ::u32 tierIndex);
-
-        void CheckSettlement(AZ::u32 tierIndex);
-
-        void FlipStreamToTier(AZ::u32 nextTier);
-
-        void CollectResults(AZStd::vector<ResolutionResult>& out);
-
-        bool HasUnresolved() const;
-
-        void Shutdown();
-
-    private:
-        physx::PxPhysics* m_physics = nullptr;
-        physx::PxScene* m_scene = nullptr;
-        physx::PxCudaContextManager* m_cuda = nullptr;
-        physx::PxPBDParticleSystem* m_particleSystem = nullptr;
-        physx::PxParticleBuffer* m_particleBuffer = nullptr;
-        physx::PxPBDMaterial* m_material = nullptr;
-
-        const ChamberVocab* m_vocab = nullptr;
-        AZStd::vector<StreamRunSlot> m_streamSlots;
-        AZStd::vector<VocabWordSlot> m_vocabSlots;
-        AZ::u32 m_totalParticles = 0;
-        AZ::u32 m_vocabParticleCount = 0;
-
-        // Phase group IDs per tier (assigned by createPhase)
-        AZStd::vector<AZ::u32> m_tierPhases;
-        AZ::u32 m_inertPhase = 0;  // Phase group 0 = graveyard
-    };
-
-    //! Orchestrates all chambers in one PxScene.
-    //! Groups runs by (length, firstChar), dispatches to chambers,
-    //! runs the tier cascade, collects results.
-    class ChamberManager
-    {
-    public:
-        bool Initialize(
-            physx::PxPhysics* physics,
-            physx::PxScene* scene,
-            physx::PxCudaContextManager* cuda,
-            const TierAssembly& tiers);
-
-        ResolutionManifest Resolve(const AZStd::vector<CharRun>& runs);
-
-        void Shutdown();
-
-    private:
-        physx::PxPhysics* m_physics = nullptr;
-        physx::PxScene* m_scene = nullptr;
-        physx::PxCudaContextManager* m_cuda = nullptr;
-        const TierAssembly* m_tiers = nullptr;
     };
 
 } // namespace HCPEngine
